@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="PMCC">
+<title>PMCC Advisor</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Sans+TC:wght@400;500;700;900&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body,#root{height:100%;overflow:hidden}
+body{background:#07090c;color:#e8e8e8;font-family:'Noto Sans TC',sans-serif;-webkit-font-smoothing:antialiased}
+::-webkit-scrollbar{width:0}
+input,textarea,button{font-family:inherit}
+input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const{useState,useEffect,useCallback,useRef}=React;
+
+// ── STORAGE ──────────────────────────────────────────────────────────────────
+const KEY="pmcc_v3";
+function load(){try{return JSON.parse(localStorage.getItem(KEY)||"[]")}catch{return[]}}
+function save(d){localStorage.setItem(KEY,JSON.stringify(d))}
+
+// ── EMA ──────────────────────────────────────────────────────────────────────
+function ema(data,n){
+  const k=2/(n+1);
+  let e=data.slice(0,n).reduce((a,b)=>a+b,0)/n;
+  const r=[e];
+  for(let i=n;i<data.length;i++){e=data[i]*k+e*(1-k);r.push(e)}
+  return r;
+}
+
+// ── FETCH MARKET DATA ────────────────────────────────────────────────────────
+async function fetchMarket(){
+  const url="https://api.allorigins.win/get?url="+encodeURIComponent(
+    "https://query1.finance.yahoo.com/v8/finance/chart/QQQ?interval=1d&range=90d"
+  );
+  const r=await fetch(url);
+  const j=await r.json();
+  const c=JSON.parse(j.contents).chart.result[0];
+  const cl=c.indicators.quote[0].close.filter(Boolean);
+  const vl=c.indicators.quote[0].volume.filter(Boolean);
+  const cur=cl.at(-1),prev=cl.at(-2),wk=cl.at(-6)||cl[0];
+  const lo20=Math.min(...cl.slice(-20));
+  const e5=ema(cl,5),e12=ema(cl,12),e20=ema(cl,20),e26=ema(cl,26);
+  const mn=e12.at(-1)-e26.at(-1),mp=e12.at(-2)-e26.at(-2);
+  const av=vl.slice(-20).reduce((a,b)=>a+b,0)/20;
+  return{
+    price:cur,
+    daily:(cur-prev)/prev*100,
+    weekly:(cur-wk)/wk*100,
+    rally:(cur-lo20)/lo20*100,
+    emaDist:(e5.at(-1)-e20.at(-1))/e20.at(-1)*100,
+    macd:mn,macdExp:mn>mp,
+    volRatio:vl.at(-1)/av
+  };
+}
+
+// ── INDICATORS ───────────────────────────────────────────────────────────────
+function evalInd(md){
+  const items=[
+    {id:"wk", name:"週漲幅",     val:`${md.weekly.toFixed(1)}%`,  fired:md.weekly>3},
+    {id:"em", name:"EMA 距離",   val:`${md.emaDist.toFixed(1)}%`, fired:md.emaDist>2.5},
+    {id:"rl", name:"距近期低點", val:`+${md.rally.toFixed(1)}%`,  fired:md.rally>12},
+    {id:"mc", name:"MACD",       val:md.macdExp&&md.macd>0?"強勢擴張":md.macd>0?"偏多":"偏空", fired:md.macdExp&&md.macd>0},
+    {id:"vl", name:"成交量比",   val:`${md.volRatio.toFixed(2)}x`,fired:md.volRatio>1.2},
+  ];
+  const f=items.filter(i=>i.fired).length;
+  return{items,fired:f,mode:f>=3?"surge":f>=1?"sideways":"bearish"};
+}
+
+// ── CLAUDE ───────────────────────────────────────────────────────────────────
+async function askClaude(md,ind,positions,ctx){
+  const pos=positions.length===0?"目前無持倉。":positions.map(p=>{
+    if(p.type==="long"){
+      const pnl=(p.current-p.cost)*100*p.qty;
+      return `Long LEAPS QQQ ${p.expiry} ${p.strike}C×${p.qty}，成本$${p.cost}，現值$${p.current}，浮盈$${pnl.toFixed(0)}，Delta ${p.delta}`;
+    }else{
+      const pnl=(p.sell-p.current)*100*p.qty;
+      const buf=md?((p.strike-md.price)/md.price*100).toFixed(1):"--";
+      return `Short Call QQQ ${p.expiry} ${p.strike}C×${p.qty}，賣出$${p.sell}，現值$${p.current}，浮盈$${pnl.toFixed(0)}，Delta ${p.delta}，緩衝${buf}%`;
+    }
+  }).join("\n");
+  const ml={surge:"急漲",sideways:"橫盤",bearish:"偏空穩定"};
+  const prompt=`今日市場：QQQ $${md.price.toFixed(2)} 今日${md.daily.toFixed(2)}% 週漲${md.weekly.toFixed(2)}%
+距低點+${md.rally.toFixed(1)}% EMA距離${md.emaDist.toFixed(1)}% MACD${md.macd.toFixed(2)}(${md.macdExp?"擴張":"收窄"}) 成交量比${md.volRatio.toFixed(2)}x
+指標觸發${ind.fired}/5 初步判斷：${ml[ind.mode]}
+
+持倉：
+${pos}
+${ctx?`補充：${ctx}`:""}
+
+請給出今日完整操作判斷，包括：市場環境評估、持倉建議、是否開新倉。200字以內，不用標題符號。`;
+  const res=await fetch("https://api.anthropic.com/v1/messages",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      model:"claude-sonnet-4-20250514",
+      max_tokens:1000,
+      system:`你是資深期權交易員，專精PMCC策略。核心：急漲讓LEAPS跑不賣Short Call；橫盤才收租；偏空保守收租。風格：直接有力，每個建議說理由。繁體中文，像信任的交易夥伴。`,
+      messages:[{role:"user",content:prompt}]
+    })
+  });
+  const d=await res.json();
+  return d.content?.[0]?.text||"分析失敗，請重試。";
+}
+
+// ── COLORS ───────────────────────────────────────────────────────────────────
+const C={
+  bg:"#07090c",surf:"#0d1320",surf2:"#0a0c10",
+  border:"#1a2535",border2:"#222f40",
+  gold:"#f0a500",goldDim:"rgba(240,165,0,0.1)",goldBorder:"rgba(240,165,0,0.25)",
+  green:"#00c896",greenDim:"rgba(0,200,150,0.08)",greenBorder:"rgba(0,200,150,0.2)",
+  red:"#f5404a",redDim:"rgba(245,64,74,0.08)",redBorder:"rgba(245,64,74,0.2)",
+  blue:"#4a9eff",blueDim:"rgba(74,158,255,0.08)",
+  text:"#e8e8e8",dim:"#6080a0",muted:"#2a3848",
+};
+
+const MODE={
+  surge:   {label:"急漲模式",color:C.red,  bg:C.redDim,  border:C.redBorder,  title:"禁止收租",  sub:"讓 LEAPS 自由運作，不賣任何 Short Call"},
+  sideways:{label:"橫盤模式",color:C.gold, bg:C.goldDim, border:C.goldBorder, title:"可以收租",  sub:"符合條件可賣出 Short Call，Delta 0.20–0.30"},
+  bearish: {label:"偏空模式",color:C.green,bg:C.greenDim,border:C.greenBorder,title:"保守收租",  sub:"Delta 0.15–0.20，行權價緩衝 5%+"},
+  unknown: {label:"等待分析",color:C.muted,bg:"transparent",border:C.border,  title:"——",       sub:"點擊上方按鈕開始今日分析"},
+};
+
+// ── COMPONENTS ───────────────────────────────────────────────────────────────
+function Dot({on,color}){
+  return <div style={{width:7,height:7,borderRadius:"50%",background:on?color:C.muted,boxShadow:on?`0 0 7px ${color}`:"none",flexShrink:0}} />;
+}
+
+function SectionLabel({children}){
+  return(
+    <div style={{display:"flex",alignItems:"center",gap:10,margin:"16px 0 10px"}}>
+      <div style={{fontSize:10,color:C.muted,letterSpacing:2,textTransform:"uppercase",whiteSpace:"nowrap",fontFamily:"'JetBrains Mono',monospace"}}>{children}</div>
+      <div style={{flex:1,height:1,background:C.border}} />
+    </div>
+  );
+}
+
+// ── MAIN ─────────────────────────────────────────────────────────────────────
+function App(){
+  const[tab,setTab]=useState("today");
+  const[positions,setPositions]=useState(load);
+  const[md,setMd]=useState(null);
+  const[ind,setInd]=useState(null);
+  const[mode,setMode]=useState("unknown");
+  const[analysis,setAnalysis]=useState("");
+  const[loading,setLoading]=useState(false);
+  const[ctx,setCtx]=useState("");
+  const[toast,setToast]=useState("");
+  const[form,setForm]=useState({type:"long",strike:"",expiry:"",cost:"",current:"",sell:"",delta:"",qty:"1"});
+  const scrollRef=useRef(null);
+
+  useEffect(()=>{save(positions)},[positions]);
+
+  const showToast=msg=>{setToast(msg);setTimeout(()=>setToast(""),2500)};
+
+  const runAnalysis=useCallback(async()=>{
+    setLoading(true);setAnalysis("正在取得市場數據...");
+    try{
+      const data=await fetchMarket();setMd(data);
+      const i=evalInd(data);setInd(i);setMode(i.mode);
+      setAnalysis("AI 交易員正在分析...");
+      const t=await askClaude(data,i,positions,ctx);
+      setAnalysis(t);
+    }catch(e){
+      console.error(e);
+      setAnalysis("數據獲取失敗。\n請確認網路連接後重試。\n\n如果問題持續，可能是市場數據來源暫時不可用，請稍後再試。");
+    }
+    setLoading(false);
+  },[positions,ctx]);
+
+  const addPos=()=>{
+    const f=form;
+    const req=f.type==="long"?["strike","expiry","cost","current","delta"]:["strike","expiry","sell","current","delta"];
+    if(req.some(k=>!f[k])){showToast("請填寫所有必填欄位");return;}
+    const p={id:Date.now(),type:f.type,strike:+f.strike,expiry:f.expiry,current:+f.current,delta:+f.delta,qty:+f.qty||1,
+      cost:f.type==="long"?+f.cost:undefined,sell:f.type==="short"?+f.sell:undefined};
+    setPositions(prev=>[...prev,p]);
+    setForm({type:"long",strike:"",expiry:"",cost:"",current:"",sell:"",delta:"",qty:"1"});
+    showToast("倉位已新增");setTab("positions");
+  };
+
+  const netPnl=positions.reduce((s,p)=>{
+    if(p.type==="long")return s+(p.current-p.cost)*100*p.qty;
+    if(p.type==="short")return s+(p.sell-p.current)*100*p.qty;
+    return s;
+  },0);
+
+  const now=new Date();
+  const dateStr=now.toLocaleDateString("zh-TW",{month:"numeric",day:"numeric",weekday:"short"});
+
+  // ── TODAY ──
+  const todayPage=(
+    <div ref={scrollRef} style={{padding:"14px 14px 20px",overflowY:"auto",height:"100%"}}>
+
+      {/* Context */}
+      <div style={{background:C.surf,border:`1px solid ${C.border}`,borderRadius:8,padding:"12px 14px",marginBottom:12}}>
+        <div style={{fontSize:10,color:C.muted,letterSpacing:1,marginBottom:8,fontFamily:"'JetBrains Mono',monospace",textTransform:"uppercase"}}>今天有需要讓我知道的情況？</div>
+        <textarea value={ctx} onChange={e=>setCtx(e.target.value)}
+          placeholder="例：下個月需要資金、對地緣事件有看法..."
+          style={{width:"100%",background:C.surf2,border:`1px solid ${C.border}`,borderRadius:6,padding:"9px 11px",color:C.text,fontSize:13,resize:"none",minHeight:64,outline:"none"}} />
+      </div>
+
+      {/* Analyze Btn */}
+      <button onClick={runAnalysis} disabled={loading}
+        style={{width:"100%",padding:14,background:loading?C.goldDim:"rgba(240,165,0,0.12)",border:`1px solid ${C.goldBorder}`,
+          borderRadius:8,color:C.gold,fontSize:14,fontWeight:700,letterSpacing:2,cursor:loading?"not-allowed":"pointer",
+          marginBottom:12,display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+        {loading?"⟳  分析中...":"⟳  開始今日分析"}
+      </button>
+
+      {/* Mode Card */}
+      {(()=>{const m=MODE[mode];return(
+        <div style={{background:m.bg,border:`1px solid ${m.border}`,borderRadius:10,padding:"16px",marginBottom:12}}>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+            <div style={{fontSize:10,fontWeight:700,color:m.color,letterSpacing:2,background:`${m.color}18`,padding:"2px 8px",borderRadius:4,fontFamily:"'JetBrains Mono',monospace"}}>{m.label}</div>
+            {ind&&<div style={{fontFamily:"'JetBrains Mono',monospace",fontSize:11,color:C.muted}}>{ind.fired}/5 觸發</div>}
+          </div>
+          <div style={{fontSize:30,fontWeight:900,color:m.color,letterSpacing:-0.5,lineHeight:1.1}}>{m.title}</div>
+          <div style={{fontSize:12,color:C.dim,marginTop:6}}>{m.sub}</div>
+        </div>
+      )})()}
+
+      {/* Market Row */}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:12}}>
+        {[
+          {label:"QQQ",val:md?`$${md.price.toFixed(2)}`:"--",up:null},
+          {label:"今日",val:md?`${md.daily>=0?"+":""}${md.daily.toFixed(2)}%`:"--",up:md?md.daily>=0:null},
+          {label:"本週",val:md?`${md.weekly>=0?"+":""}${md.weekly.toFixed(1)}%`:"--",up:md?md.weekly>=0:null},
+        ].map(it=>(
+          <div key={it.label} style={{background:C.surf,border:`1px solid ${C.border}`,borderRadius:8,padding:"11px 8px",textAlign:"center"}}>
+            <div style={{fontSize:10,color:C.muted,marginBottom:5,fontFamily:"'JetBrains Mono',monospace"}}>{it.label}</div>
+            <div style={{fontSize:16,fontWeight:700,color:it.up===null?C.text:it.up?C.green:C.red,fontVariantNumeric:"tabular-nums"}}>{it.val}</div>
+          </div>
+        ))}
+      </div>
+
+      {/* Indicators */}
+      <SectionLabel>技術指標</SectionLabel>
+      {(ind?ind.items:[
+        {id:"wk",name:"週漲幅",val:"--",fired:false},
+        {id:"em",name:"EMA 距離",val:"--",fired:false},
+        {id:"rl",name:"距近期低點",val:"--",fired:false},
+        {id:"mc",name:"MACD",val:"--",fired:false},
+        {id:"vl",name:"成交量比",val:"--",fired:false},
+      ]).map(it=>(
+        <div key={it.id} style={{display:"flex",alignItems:"center",justifyContent:"space-between",
+          background:C.surf,border:`1px solid ${C.border}`,borderRadius:7,padding:"11px 13px",marginBottom:7}}>
+          <div style={{display:"flex",alignItems:"center",gap:10}}>
+            <Dot on={it.fired} color={it.fired?C.red:C.green} />
+            <div style={{fontSize:13,color:C.dim}}>{it.name}</div>
+          </div>
+          <div style={{fontSize:13,fontWeight:600,color:it.fired?C.red:C.text,fontVariantNumeric:"tabular-nums",fontFamily:"'JetBrains Mono',monospace"}}>{it.val}</div>
+        </div>
+      ))}
+
+      {/* Analysis */}
+      <SectionLabel>AI 交易員判斷</SectionLabel>
+      <div style={{background:C.surf,border:`1px solid ${C.border}`,borderRadius:10,padding:"16px 14px",
+        borderTop:`2px solid ${C.gold}`}}>
+        <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:12}}>
+          <div style={{width:7,height:7,borderRadius:"50%",background:C.gold,boxShadow:`0 0 8px ${C.gold}`}} />
+          <div style={{fontSize:10,color:C.gold,letterSpacing:2,textTransform:"uppercase",fontFamily:"'JetBrains Mono',monospace",fontWeight:700}}>今日分析報告</div>
+        </div>
+        <div style={{fontSize:14,color:C.dim,lineHeight:1.95,whiteSpace:"pre-wrap"}}>
+          {analysis||"點擊「開始今日分析」\nAI 交易員將根據市場數據和你的持倉，給出今天的操作建議。"}
+        </div>
+      </div>
+    </div>
+  );
+
+  // ── POSITIONS ──
+  const posPage=(
+    <div style={{padding:"14px 14px 20px",overflowY:"auto",height:"100%"}}>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:14}}>
+        {[
+          {label:"組合淨值",val:`${netPnl>=0?"+":""}$${Math.abs(netPnl).toFixed(0)}`,profit:netPnl>=0},
+          {label:"持倉數量",val:`${positions.length} 張`,profit:null},
+        ].map(it=>(
+          <div key={it.label} style={{background:C.surf,border:`1px solid ${C.border}`,borderRadius:8,padding:"14px 12px"}}>
+            <div style={{fontSize:10,color:C.muted,marginBottom:6,fontFamily:"'JetBrains Mono',monospace"}}>{it.label}</div>
+            <div style={{fontSize:24,fontWeight:900,color:it.profit===null?C.gold:it.profit?C.green:C.red,fontVariantNumeric:"tabular-nums"}}>{it.val}</div>
+          </div>
+        ))}
+      </div>
+
+      <SectionLabel>當前持倉</SectionLabel>
+
+      {positions.length===0?(
+        <div style={{textAlign:"center",padding:"40px 20px",color:C.muted,fontSize:13,lineHeight:2}}>
+          尚未新增任何持倉<br />前往「新增」開始
+        </div>
+      ):positions.map(p=>{
+        const pnl=p.type==="long"?(p.current-p.cost)*100*p.qty:(p.sell-p.current)*100*p.qty;
+        const pct=p.type==="long"?((p.current-p.cost)/p.cost*100):((p.sell-p.current)/p.sell*100);
+        let aType="ok",aMsg="";
+        if(p.type==="long"){
+          aMsg=`持有中 · Delta ${p.delta} · 每漲$10賺$${(p.delta*1000*p.qty).toFixed(0)}`;
+        }else{
+          const buf=md?((p.strike-md.price)/md.price*100):null;
+          if(buf!==null&&buf<2){aType="danger";aMsg=`🔴 緩衝僅 ${buf.toFixed(1)}%，建議立即 Roll`;}
+          else if(p.delta>0.40){aType="danger";aMsg=`⚠️ Delta ${p.delta} 超過警戒線 0.40`;}
+          else if(pnl<0&&Math.abs(pct)>150){aType="warn";aMsg=`⚠️ 虧損超過 150%，接近停損線`;}
+          else{aMsg=`50%獲利點 $${(p.sell*0.5).toFixed(2)} · 停損 $${(p.sell*2).toFixed(2)}`;}
+        }
+        const aC=aType==="ok"?C.green:aType==="warn"?C.gold:C.red;
+        return(
+          <div key={p.id} style={{background:C.surf,border:`1px solid ${C.border}`,borderRadius:10,padding:"16px 14px",marginBottom:10}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12}}>
+              <div>
+                <div style={{fontSize:10,fontWeight:700,letterSpacing:1.5,padding:"3px 8px",borderRadius:4,
+                  background:p.type==="long"?C.greenDim:C.redDim,color:p.type==="long"?C.green:C.red,
+                  border:`1px solid ${p.type==="long"?C.greenBorder:C.redBorder}`,display:"inline-block",fontFamily:"'JetBrains Mono',monospace"}}>
+                  {p.type==="long"?"LONG LEAPS":"SHORT CALL"}
+                </div>
+                <div style={{fontSize:15,fontWeight:700,color:C.text,marginTop:7,fontFamily:"'JetBrains Mono',monospace"}}>QQQ {p.expiry} {p.strike}C × {p.qty}</div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontSize:24,fontWeight:900,color:pnl>=0?C.green:C.red,fontVariantNumeric:"tabular-nums"}}>{pnl>=0?"+":""}${Math.abs(pnl).toFixed(0)}</div>
+                <div style={{fontSize:11,color:C.muted,fontFamily:"'JetBrains Mono',monospace"}}>{pnl>=0?"+":""}{pct.toFixed(1)}%</div>
+              </div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:7,marginBottom:10}}>
+              {[
+                {l:p.type==="long"?"成本":"賣出價",v:`$${p.type==="long"?p.cost:p.sell}`},
+                {l:"現值",v:`$${p.current}`},
+                {l:"Delta",v:p.delta},
+              ].map(d=>(
+                <div key={d.l} style={{background:C.surf2,borderRadius:6,padding:"8px 10px"}}>
+                  <div style={{fontSize:9,color:C.muted,marginBottom:4}}>{d.l}</div>
+                  <div style={{fontSize:13,fontWeight:600,color:C.text,fontVariantNumeric:"tabular-nums",fontFamily:"'JetBrains Mono',monospace"}}>{d.v}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{padding:"9px 12px",borderRadius:6,fontSize:12,borderLeft:`3px solid ${aC}`,
+              background:`${aC}10`,color:aC,fontFamily:"'JetBrains Mono',monospace"}}>{aMsg}</div>
+            <button onClick={()=>{setPositions(prev=>prev.filter(x=>x.id!==p.id));showToast("已刪除");}}
+              style={{width:"100%",marginTop:10,padding:"8px",background:"transparent",border:`1px solid ${C.border}`,
+                borderRadius:6,color:C.muted,fontSize:11,cursor:"pointer",letterSpacing:1}}>刪除此倉位</button>
+          </div>
+        );
+      })}
+    </div>
+  );
+
+  // ── ADD ──
+  const addPage=(
+    <div style={{padding:"14px 14px 20px",overflowY:"auto",height:"100%"}}>
+      <div style={{background:C.surf,border:`1px solid ${C.border}`,borderRadius:10,padding:"18px 14px"}}>
+        <div style={{fontSize:12,color:C.gold,letterSpacing:2,textTransform:"uppercase",marginBottom:14,fontWeight:700,fontFamily:"'JetBrains Mono',monospace"}}>新增倉位</div>
+
+        {/* Type Toggle */}
+        <div style={{display:"flex",gap:8,marginBottom:16}}>
+          {["long","short"].map(t=>(
+            <button key={t} onClick={()=>setForm(f=>({...f,type:t}))}
+              style={{flex:1,padding:"11px",borderRadius:6,cursor:"pointer",fontSize:13,fontWeight:700,letterSpacing:0.5,
+                border:form.type===t?`1px solid ${C.gold}`:`1px solid ${C.border}`,
+                background:form.type===t?C.goldDim:"transparent",
+                color:form.type===t?C.gold:C.muted}}>
+              {t==="long"?"Long LEAPS":"Short Call"}
+            </button>
+          ))}
+        </div>
+
+        {/* Fields */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
+          {[
+            {key:"strike",  label:"行權價",                          ph:form.type==="long"?"515":"750"},
+            {key:"expiry",  label:"到期日 YYMMDD",                   ph:form.type==="long"?"270115":"260630"},
+            {key:form.type==="long"?"cost":"sell",
+                            label:form.type==="long"?"買入成本":"賣出價格",ph:form.type==="long"?"124.72":"8.50"},
+            {key:"current", label:"現值",                            ph:form.type==="long"?"226.05":"5.00"},
+            {key:"delta",   label:"Delta",                           ph:form.type==="long"?"0.75":"0.25"},
+            {key:"qty",     label:"張數",                            ph:"1"},
+          ].map(f=>(
+            <div key={f.key}>
+              <div style={{fontSize:10,color:C.muted,marginBottom:6,fontFamily:"'JetBrains Mono',monospace"}}>{f.label}</div>
+              <input type="number" step="any" placeholder={f.ph}
+                value={form[f.key]||""}
+                onChange={e=>setForm(prev=>({...prev,[f.key]:e.target.value}))}
+                style={{width:"100%",background:C.surf2,border:`1px solid ${C.border2}`,borderRadius:6,
+                  padding:"12px",color:C.text,fontSize:15,fontWeight:700,outline:"none",fontVariantNumeric:"tabular-nums"}} />
+            </div>
+          ))}
+        </div>
+
+        <button onClick={addPos}
+          style={{width:"100%",padding:15,background:`linear-gradient(135deg,${C.gold},#c8841a)`,
+            border:"none",borderRadius:8,color:"#000",fontSize:14,fontWeight:900,letterSpacing:2,cursor:"pointer"}}>
+          新增 {form.type==="long"?"Long LEAPS":"Short Call"}
+        </button>
+      </div>
+    </div>
+  );
+
+  // ── RENDER ──
+  return(
+    <div style={{background:C.bg,minHeight:"100vh",maxWidth:430,margin:"0 auto",display:"flex",flexDirection:"column",height:"100dvh"}}>
+
+      {/* Header */}
+      <div style={{background:"rgba(7,9,12,0.97)",backdropFilter:"blur(12px)",padding:"16px 16px 12px",
+        borderBottom:`1px solid ${C.border}`,display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0,
+        paddingTop:"max(16px, env(safe-area-inset-top, 16px))"}}>
+        <div>
+          <div style={{fontSize:18,fontWeight:900,color:C.text,letterSpacing:1}}>PMCC ADVISOR</div>
+          <div style={{fontSize:10,color:C.muted,marginTop:2,letterSpacing:1,fontFamily:"'JetBrains Mono',monospace"}}>AI TRADING INTELLIGENCE</div>
+        </div>
+        <div style={{fontSize:11,color:C.muted,fontFamily:"'JetBrains Mono',monospace"}}>{dateStr}</div>
+      </div>
+
+      {/* Tabs */}
+      <div style={{display:"flex",background:"#0d1018",borderBottom:`1px solid ${C.border}`,flexShrink:0}}>
+        {[["today","今日分析"],["positions","持倉"],["add","新增"]].map(([id,label])=>(
+          <div key={id} onClick={()=>setTab(id)}
+            style={{flex:1,padding:"13px 8px",textAlign:"center",fontSize:13,fontWeight:tab===id?700:400,
+              color:tab===id?C.gold:C.muted,borderBottom:tab===id?`2px solid ${C.gold}`:"2px solid transparent",
+              cursor:"pointer",transition:"all 0.15s",letterSpacing:0.5}}>
+            {label}
+          </div>
+        ))}
+      </div>
+
+      {/* Content */}
+      <div style={{flex:1,overflow:"hidden"}}>
+        {tab==="today"     && todayPage}
+        {tab==="positions" && posPage}
+        {tab==="add"       && addPage}
+      </div>
+
+      {/* Bottom Nav */}
+      <div style={{background:"rgba(7,9,12,0.97)",backdropFilter:"blur(12px)",borderTop:`1px solid ${C.border}`,
+        display:"flex",flexShrink:0,paddingBottom:"env(safe-area-inset-bottom, 0)"}}>
+        {[{id:"today",icon:"🧠",label:"今日"},{id:"positions",icon:"📊",label:"持倉"},{id:"add",icon:"＋",label:"新增"}].map(n=>(
+          <button key={n.id} onClick={()=>setTab(n.id)}
+            style={{flex:1,padding:"12px 8px",display:"flex",flexDirection:"column",alignItems:"center",gap:4,
+              background:"none",border:"none",cursor:"pointer"}}>
+            <div style={{fontSize:20,opacity:tab===n.id?1:0.3}}>{n.icon}</div>
+            <div style={{fontSize:9,letterSpacing:1,color:tab===n.id?C.gold:C.muted,textTransform:"uppercase",
+              fontWeight:tab===n.id?700:400,fontFamily:"'JetBrains Mono',monospace"}}>{n.label}</div>
+          </button>
+        ))}
+      </div>
+
+      {/* Toast */}
+      {toast&&(
+        <div style={{position:"fixed",bottom:90,left:"50%",transform:"translateX(-50%)",
+          background:C.surf,border:`1px solid ${C.border2}`,borderRadius:6,padding:"10px 18px",
+          fontSize:12,color:C.text,zIndex:200,whiteSpace:"nowrap",fontFamily:"'JetBrains Mono',monospace"}}>
+          {toast}
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
