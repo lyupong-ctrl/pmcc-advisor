@@ -1,0 +1,1498 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="PMCC">
+<title>PMCC Advisor</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Noto+Sans+TC:wght@400;500;700;900&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html,body,#root{height:100%;overflow:hidden}
+body{background:#07090c;color:#e8e8e8;font-family:'Noto Sans TC',sans-serif;-webkit-font-smoothing:antialiased}
+::-webkit-scrollbar{width:0}
+input,textarea,button{font-family:inherit}
+input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.4}}
+@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
+.fade-in{animation:fadeIn 0.35s ease forwards}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const{useState,useCallback}=React;
+const WORKER_URL="https://pmcc-proxy.lyupong.workers.dev";
+const KEY="pmcc_v10";
+
+// ── Storage ───────────────────────────────────────────────────────────────────
+function load(){try{return JSON.parse(localStorage.getItem(KEY)||"{}")}catch{return{}}}
+function save(d){localStorage.setItem(KEY,JSON.stringify(d))}
+function loadPos(){try{return load().positions||[]}catch{return[]}}
+function savePos(p){const s=load();s.positions=p;save(s)}
+function loadWeek2(){try{return load().week2||null}catch{return null}}
+function saveWeek2(w){const s=load();s.week2=w;save(s)}
+function loadLastDecision(){try{return load().lastDecision||null}catch{return null}}
+function saveLastDecision(d){const s=load();s.lastDecision=d;save(s)}
+function loadHistHistory(){try{return load().histHistory||[]}catch{return[]}}
+function saveHistHistory(h){const s=load();s.histHistory=h.slice(-4);save(s)}
+// 週五基準決策儲存
+function loadWeeklyBase(){try{return load().weeklyBase||null}catch{return null}}
+function saveWeeklyBase(b){const s=load();s.weeklyBase=b;save(s)}
+
+function calcEMA(data,n){
+  if(data.length<n)return[data.at(-1)||0];
+  const k=2/(n+1);
+  let e=data.slice(0,n).reduce((a,b)=>a+b,0)/n;
+  const r=[e];
+  for(let i=n;i<data.length;i++){e=data[i]*k+e*(1-k);r.push(e)}
+  return r;
+}
+
+// ── 數據源：全部透過 Cloudflare Worker（Yahoo Finance）────────────────────────
+// Worker 路由：
+//   POST /           → Claude API
+//   GET  /market/weekly  → Yahoo 週K（2年歷史）
+//   GET  /market/daily   → Yahoo 日K（60日歷史）
+//   GET  /market/live    → Yahoo 即時報價（今日分時）
+
+async function workerFetch(path){
+  const r=await fetch(WORKER_URL+path,{signal:AbortSignal.timeout(12000)});
+  if(!r.ok)throw new Error(`Worker ${path} HTTP ${r.status}`);
+  const d=await r.json();
+  if(!d.ok)throw new Error(d.error||`Worker ${path} 回傳錯誤`);
+  return d;
+}
+
+// ── 週線數據（週五分析用）────────────────────────────────────────────────────
+async function fetchWeeklyMarket(){
+  const [wd,live]=await Promise.all([
+    workerFetch("/market/weekly"),
+    fetch(WORKER_URL+"/market/live",{signal:AbortSignal.timeout(8000)})
+      .then(r=>r.json()).catch(()=>null),
+  ]);
+  const wkBars=wd.results;
+  if(wkBars.length<30)throw new Error("週線數據不足");
+
+  const now=new Date();
+  // 用美東時間判斷本週K是否已收盤
+  // 美股週線收盤時間：美東週五 16:00
+  const nowET=new Date(now.toLocaleString("en-US",{timeZone:"America/New_York"}));
+  const dowET=nowET.getDay();
+  const hourET=nowET.getHours();
+  // 本週K未收盤條件：美東週一到週五 16:00 之前
+  const isOpen=dowET>=1&&dowET<=5&&!(dowET===5&&hourET>=16);
+  const dayNames=["日","一","二","三","四","五","六"];
+  const todayLabel=`週${dayNames[now.getDay()]}`;
+
+  const lastBar=wkBars.at(-1);
+
+  const mainBars=isOpen?wkBars.slice(0,-1):wkBars;
+  const cl=mainBars.map(b=>b.c);
+  const vl=mainBars.map(b=>b.v);
+  const ll=mainBars.map(b=>b.l);
+
+  const cur=cl.at(-1),prev=cl.at(-2),prev2=cl.at(-3);
+  const weeklyChg=(cur-prev)/prev*100;
+  const weeklyChgPrev=(prev-prev2)/prev2*100;
+  const mo4=cl.at(-5)||cl[0];
+  const monthly=(cur-mo4)/mo4*100;
+  const yr=cl.slice(-52);
+  const hi52=Math.max(...yr),lo52=Math.min(...yr);
+  const fromHi52=(cur-hi52)/hi52*100;
+  const fromLo52=(cur-lo52)/lo52*100;
+  const histPct=Math.round((cur-lo52)/(hi52-lo52)*100);
+  const e5=calcEMA(cl,5),e10=calcEMA(cl,10),e20=calcEMA(cl,20),e40=calcEMA(cl,40);
+  const distE20=(cur-e20.at(-1))/e20.at(-1)*100;
+  const e12=calcEMA(cl,12),e26=calcEMA(cl,26);
+  const macdLine=cl.map((_,i)=>{
+    const i12=Math.max(0,e12.length-cl.length+i);
+    const i26=Math.max(0,e26.length-cl.length+i);
+    return(e12[i12]||0)-(e26[i26]||0);
+  });
+  const macdNow=e12.at(-1)-e26.at(-1);
+  const macdPrev=e12.at(-2)-e26.at(-2);
+  const sig9=calcEMA(macdLine,9);
+  const histNow=macdNow-sig9.at(-1);
+  const histPrev=macdPrev-sig9.at(-2);
+  const avgVol20=vl.slice(-20).reduce((a,b)=>a+b,0)/20;
+  const volRatio=avgVol20>0?vl.at(-1)/avgVol20:1;
+  const weekIntraSwing=(cur-ll.at(-1))/ll.at(-1)*100;
+  const wk2Up=cur>prev&&prev>prev2;
+  const wk3Up=cur>prev&&prev>prev2&&(cl.at(-4)!=null?prev2>cl.at(-4):true);
+  const wk2Down=cur<prev&&prev<prev2;
+
+  let thisWeek=null;
+  if(isOpen){
+    const tw=wkBars.at(-1);
+    const prevClose=mainBars.at(-1).c;
+    const liveOk=live?.ok&&live?.price;
+    const livePrice=liveOk?live.price:tw.c;
+    const chg=(livePrice-prevClose)/prevClose*100;
+    const todayVol=liveOk?live.volume:tw.v;
+    thisWeek={
+      price:livePrice,chg,
+      high:liveOk?live.high:tw.h,
+      low:liveOk?live.low:tw.l,
+      dayLabel:todayLabel,
+      volRatio:avgVol20>0?todayVol/avgVol20:null,
+      volRatioSource:liveOk?"Yahoo即時":"週K估算",
+      updatedAt:live?.updatedAt||null,
+      isMarketOpen:live?.isMarketOpen||false,
+    };
+  }
+
+  const histArr=[
+    macdLine.at(-4)-(calcEMA(macdLine,9).at(-4)||0),
+    macdLine.at(-3)-(calcEMA(macdLine,9).at(-3)||0),
+    histPrev,histNow,
+  ];
+
+  return{
+    price:cur,prev,weekly:weeklyChg,weeklyPrev:weeklyChgPrev,monthly,
+    hi52,lo52,fromHi52,fromLo52,histPct,
+    ema5:e5.at(-1),ema10:e10.at(-1),ema20:e20.at(-1),ema40:e40.at(-1),distE20,
+    macd:macdNow,macdPrev,macdExp:macdNow>macdPrev,
+    histNow,histPrev,histShrink:histPrev!==0?Math.abs((histNow-histPrev)/histPrev)*100:0,
+    histArr,volRatio,weekIntraSwing,
+    wk2Up,wk3Up,wk2Down,
+    aboveE20:cur>e20.at(-1),aboveE40:cur>e40.at(-1),
+    monthTrend:cur>e20.at(-1)?"up":cur<e20.at(-1)*0.97?"down":"flat",
+    thisWeek,isCurrentWeekOpen:isOpen,todayLabel,
+  };
+}
+
+// ── 日線數據（每日分析用）────────────────────────────────────────────────────
+async function fetchDailyMarket(){
+  const [dd,live]=await Promise.all([
+    workerFetch("/market/daily"),
+    fetch(WORKER_URL+"/market/live",{signal:AbortSignal.timeout(8000)})
+      .then(r=>r.json()).catch(()=>null),
+  ]);
+  const dayBars=dd.results;
+  if(dayBars.length<20)throw new Error("日線數據不足");
+
+  const cl=dayBars.map(b=>b.c);
+  const vl=dayBars.map(b=>b.v);
+  const now=new Date();
+  const dayNames=["日","一","二","三","四","五","六"];
+  const todayLabel=`週${dayNames[now.getDay()]}`;
+
+  const liveOk=live?.ok&&live?.price;
+  const latestBar=dayBars.at(-1);
+  const livePrice=liveOk?live.price:latestBar.c;
+  const liveOpen=liveOk?live.open:latestBar.o;
+  const liveHigh=liveOk?live.high:latestBar.h;
+  const liveLow=liveOk?live.low:latestBar.l;
+  const liveVol=liveOk?live.volume:latestBar.v;
+  const prevClose=liveOk?live.prevClose:cl.at(-2);
+
+  const dailyChg=prevClose?(livePrice-prevClose)/prevClose*100:0;
+  const avgVol20=vl.slice(-21,-1).reduce((a,b)=>a+b,0)/20;
+  const dayRV=avgVol20>0?liveVol/avgVol20:1;
+  const e20d=calcEMA(cl,20);
+  const aboveE20d=livePrice>e20d.at(-1);
+  const hi10=Math.max(...cl.slice(-9),livePrice);
+  const lo10=Math.min(...cl.slice(-9),livePrice);
+
+  const body=Math.abs(livePrice-liveOpen);
+  const range=liveHigh-liveLow;
+  const candleType=range<0.01?"無量":
+    body/range>0.6?(livePrice>liveOpen?"實體陽線":"實體陰線"):
+    livePrice>liveOpen?"上影陽線":"下影陰線";
+
+  // 市場狀態標示
+  const marketState=live?.marketState||"UNKNOWN";
+  const marketLabel=
+    marketState==="REGULAR"?"盤中":
+    marketState==="PRE"    ?"盤前":
+    marketState==="POST"   ?"盤後":
+    "休市";
+
+  return{
+    price:livePrice,prev:prevClose,daily:dailyChg,dayRV,
+    high:liveHigh,low:liveLow,open:liveOpen,
+    e20d:e20d.at(-1),aboveE20d,
+    hi10,lo10,candleType,todayLabel,
+    marketState,marketLabel,
+    isMarketOpen:live?.isMarketOpen||false,
+    isPostMarket:live?.isPostMarket||false,
+    isPreMarket:live?.isPreMarket||false,
+    updatedAt:live?.updatedAt||(liveOk?"即時":"歷史收盤"),
+    dataSource:liveOk?"Yahoo即時":"Yahoo日K",
+  };
+}
+
+// ── 新聞抓取 ──────────────────────────────────────────────────────────────────
+async function fetchNews(){
+  const sources=[
+    "https://corsproxy.io/?"+encodeURIComponent("https://feeds.finance.yahoo.com/rss/2.0/headline?s=QQQ&region=US&lang=en-US"),
+    "https://api.allorigins.win/raw?url="+encodeURIComponent("https://feeds.finance.yahoo.com/rss/2.0/headline?s=QQQ&region=US&lang=en-US"),
+  ];
+  for(const url of sources){
+    try{
+      const r=await fetch(url,{signal:AbortSignal.timeout(6000)});
+      if(!r.ok)continue;
+      const txt=await r.text();
+      const doc=new DOMParser().parseFromString(txt,"text/xml");
+      const items=doc.querySelectorAll("item");
+      if(!items.length)continue;
+      const headlines=Array.from(items).slice(0,8).map(item=>{
+        const title=item.querySelector("title")?.textContent||"";
+        const pub=item.querySelector("pubDate")?.textContent||"";
+        return`${title}(${pub.substring(0,16)})`;
+      }).filter(h=>h.length>5);
+      if(headlines.length)return headlines.join("\n");
+    }catch{continue;}
+  }
+  return null;
+}
+
+// ── 週線分析邏輯 ──────────────────────────────────────────────────────────────
+function analyzeTrend(md,week2State){
+  const p=md.histPct;
+  let posLabel,posColor;
+  if(p>=80){posLabel="歷史高位區";posColor="red";}
+  else if(p>=55){posLabel="中高位區";posColor="amber";}
+  else if(p>=30){posLabel="中間位置";posColor="blue";}
+  else{posLabel="歷史低位區";posColor="green";}
+
+  const isBottomSignalA=md.weekly>3&&md.volRatio>1.2;
+  const isBottomSignalC=md.weekIntraSwing>5;
+  const isBottomSignalB=md.weekly>2&&md.weeklyPrev>2;
+  const hasBottomSignal=isBottomSignalA||isBottomSignalC||isBottomSignalB;
+  const isUptrend=md.aboveE20&&md.macd>0&&md.wk2Up;
+  const isDowntrend=!md.aboveE20&&md.macd<0&&md.wk2Down;
+  const isTopReversal=p>80&&md.wk2Down&&md.monthly<-5;
+  const isFakeSignal=md.volRatio>2.5&&Math.abs(md.weekly)<1;
+  const isTopWarningVol=p>80&&md.volRatio<0.7;
+  const histShrinkBig=md.histNow<0||(md.histPrev>0&&md.histShrink>50);
+  const isTopConfirm=md.weekly<-1.5&&md.volRatio>1.0&&histShrinkBig;
+
+  let strLabel,strColor,strDetail;
+  if(hasBottomSignal&&p<55){strLabel="底部反轉信號";strColor="green";strDetail=`週漲${md.weekly.toFixed(1)}%，RV=${md.volRatio.toFixed(2)}x，底部放量反彈`;}
+  else if(isTopReversal){strLabel="頂部反轉警示";strColor="red";strDetail=`週線連跌，月跌${Math.abs(md.monthly).toFixed(1)}%`;}
+  else if(isUptrend){strLabel="上升趨勢持續";strColor="amber";strDetail="站穩週線EMA20，MACD偏多，週線連漲";}
+  else if(isDowntrend){strLabel="下跌趨勢中";strColor="red";strDetail="跌破週線EMA20，MACD偏空";}
+  else{strLabel="趨勢整理中";strColor="blue";strDetail="EMA20附近整理，等待方向確認";}
+
+  const momScore=(md.macdExp?1:0)+(md.volRatio>1.0?1:0)+(md.weekly>2?1:0)+(md.distE20>2?1:0);
+  const momLabel=momScore>=3?"強勁":momScore>=2?"溫和":"疲弱";
+  const momColor=momScore>=3?"green":momScore>=2?"amber":"red";
+
+  const isWeek1Signal=hasBottomSignal&&p<60&&!isFakeSignal;
+  const isWeek2Confirm=week2State&&md.weekly>2&&md.volRatio>0.8;
+  const isWeek2Weak=week2State&&md.weekly>2&&md.volRatio<=0.8;
+  const isWeek2StopLoss=week2State&&md.weekly<-2;
+  const cond1=p<35,cond2=md.wk3Up,cond3=md.aboveE20,cond4=md.monthly>5,cond5=md.fromLo52>8;
+  const condCount=[cond1,cond2,cond3,cond4,cond5].filter(Boolean).length;
+
+  let decision,decColor,decDetail,positionSize="";
+  if(isFakeSignal){decision="假信號警告";decColor="red";decDetail="量價背離：大量推不動價格，不進場";}
+  else if(isTopConfirm||isTopReversal){decision="評估離場";decColor="red";decDetail="頂部確認信號，次週開盤執行離場";}
+  else if(isWeek2StopLoss){decision="止損出場";decColor="red";decDetail="第二週跌破第一週低點，假信號保護觸發";}
+  else if(isWeek2Confirm){decision="加倉至全倉";decColor="green";decDetail="第二週確認：週漲>2%且量能維持，加至全倉";positionSize="全倉";}
+  else if(isWeek2Weak){decision="持有半倉觀察";decColor="amber";decDetail="第二週縮量上漲，量能不足，維持半倉繼續觀察";positionSize="半倉";}
+  else if(isWeek1Signal&&condCount>=3){decision="半倉建倉";decColor="green";decDetail=`底部信號出現（${condCount}/5確認條件），半倉試探進場`;positionSize="半倉";}
+  else if(isUptrend&&p<75&&md.distE20<10){decision="持倉讓跑";decColor="gold";decDetail="週線上升趨勢中段，讓LEAPS完整參與，禁止Short Call";}
+  else if(isUptrend&&(p>=75||md.distE20>=10)){decision="謹慎持有";decColor="amber";decDetail="接近高位或過度拉伸，監控頂部警示條件";}
+  else if(isTopWarningVol){decision="頂部警戒";decColor="amber";decDetail="高位量縮，頂部警示之一，進入警戒狀態";}
+  else if(!md.aboveE20&&Math.abs(md.weekly)<1.5){decision="收租觀察";decColor="blue";decDetail="週線橫盤整理，可考慮保守Short Call";}
+  else{decision="觀察等待";decColor="muted";decDetail="週線信號不明確，持有SGOV等待底部信號";}
+
+  const strike1=Math.round(md.price*0.80/5)*5;
+  const strike2=Math.round(md.price*0.85/5)*5;
+  let actionSteps=[];
+  if(decision==="半倉建倉"){
+    actionSteps=[
+      {icon:"!",text:`本週收盤出現底部信號（${condCount}/5確認條件）`,check:null},
+      {icon:"1",text:`下週開盤：買入 Long LEAPS 半倉（$8,000），行權價 $${strike1}–$${strike2}，到期 12–18 個月`,check:null},
+      {icon:"2",text:`止損線：本週最低點跌破即出場`,check:null},
+      {icon:"3",text:"下週若再漲>2%且RV>0.8x → 加至全倉",check:null},
+    ];
+  }else if(decision==="加倉至全倉"){
+    actionSteps=[
+      {icon:"✓",text:"第二週確認：週漲>2%，量能維持",check:true},
+      {icon:"1",text:`執行：追加 Long LEAPS 至全倉（再買$8,000），行權價 $${strike1}–$${strike2}`,check:null},
+      {icon:"2",text:"全倉後禁止賣 Short Call",check:null},
+      {icon:"3",text:`站上週線EMA20（$${md.ema20.toFixed(0)}）= 趨勢完全確認`,check:md.aboveE20},
+    ];
+  }else if(decision==="持有半倉觀察"){
+    actionSteps=[
+      {icon:"○",text:"本週不加倉，量能不足（RV<0.8x），維持半倉",check:null},
+      {icon:"2",text:"下週若放量（RV>0.8x）+ 漲>2% → 加至全倉",check:null},
+      {icon:"3",text:"止損線仍有效：跌破第一週最低點立即出場",check:null},
+    ];
+  }else if(decision==="止損出場"){
+    actionSteps=[
+      {icon:"!",text:"跌破第一週最低點，假信號保護觸發",check:false},
+      {icon:"1",text:"下週開盤立即賣出 LEAPS，不猶豫",check:null},
+      {icon:"2",text:"出場後持有SGOV，重新等待底部信號",check:null},
+    ];
+  }else if(decision==="評估離場"||decision==="頂部警戒"){
+    actionSteps=[
+      {icon:"!",text:decision==="評估離場"?"頂部確認，下週開盤執行離場":"高位量縮，進入警戒狀態",check:false},
+      {icon:"2",text:decision==="評估離場"?"不等更高點，確認即行動":"監控MACD Histogram是否急縮>50%",check:null},
+      {icon:"3",text:"離場後持有SGOV，等待下一個底部週期",check:null},
+    ];
+  }else if(decision==="持倉讓跑"){
+    actionSteps=[
+      {icon:"○",text:"本週不需要任何操作",check:true},
+      {icon:"2",text:`監控：若跌破週EMA20（$${md.ema20.toFixed(0)}）才需重新評估`,check:null},
+      {icon:"3",text:"禁止賣 Short Call，趨勢向上中段不干擾",check:null},
+    ];
+  }else if(decision==="謹慎持有"){
+    actionSteps=[
+      {icon:"1",text:`高位警示：百分位${p}%，注意量縮信號（RV<0.7x）`,check:false},
+      {icon:"2",text:"不加倉，監控KDJ超買和MACD Histogram走向",check:null},
+      {icon:"3",text:"出現頂部確認條件即行動，不猶豫",check:null},
+    ];
+  }else if(decision==="收租觀察"){
+    const scStrike=Math.round(md.price*1.05/5)*5;
+    actionSteps=[
+      {icon:"1",text:`週線橫盤，可考慮賣保守 Short Call：行權價 $${scStrike}+，Delta 0.15–0.20`,check:null},
+      {icon:"2",text:"確認無頂部警示，緩衝>5%才執行",check:null},
+      {icon:"3",text:`跌破EMA20（$${md.ema20.toFixed(0)}）立即重新評估`,check:null},
+    ];
+  }else{
+    actionSteps=[
+      {icon:"○",text:"本週不執行任何操作",check:true},
+      {icon:"2",text:`空倉持有SGOV，等待週線底部信號`,check:null},
+      {icon:"3",text:`關注週線EMA20（$${md.ema20.toFixed(0)}）作為支撐參考`,check:null},
+    ];
+  }
+
+  return{
+    position:{label:posLabel,color:posColor,pct:p},
+    structure:{label:strLabel,color:strColor,detail:strDetail},
+    momentum:{label:momLabel,color:momColor,score:momScore},
+    decision,decColor,decDetail,actionSteps,positionSize,condCount,
+    isBottomSignalA,isBottomSignalB,isBottomSignalC,
+    isTopReversal,isUptrend,isDowntrend,
+    isFakeSignal,isTopWarningVol,isTopConfirm,
+    isWeek1Signal,isWeek2Confirm,
+  };
+}
+
+// ── 市場時間段判斷 ────────────────────────────────────────────────────────────
+function getMarketPhase(){
+  const now=new Date();
+  const et=new Date(now.toLocaleString("en-US",{timeZone:"America/New_York"}));
+  const dow=et.getDay();
+  const h=et.getHours();
+  const m=et.getMinutes();
+  const timeVal=h*60+m;
+
+  const OPEN=9*60+30;
+  const CLOSE=16*60;
+  const POSTEND=20*60;
+
+  if(dow===0){
+    // 週日 → 上週回顧
+    return"week_review";
+  }
+  if(dow===6){
+    // 週六：盤後結束前=本週總結，之後=上週回顧
+    return timeVal<POSTEND?"week_summary":"week_review";
+  }
+  if(dow>=1&&dow<=4){
+    if(timeVal<4*60)  return"week_review";  // 凌晨4點前，回顧上週
+    if(timeVal<OPEN)  return"daily_pre";
+    if(timeVal<CLOSE) return"daily_live";
+    if(timeVal<POSTEND)return"daily_post";
+    return"week_review";
+  }
+  if(dow===5){
+    if(timeVal<4*60)  return"week_review";
+    if(timeVal<OPEN)  return"daily_pre";
+    if(timeVal<CLOSE) return"daily_live";
+    if(timeVal<POSTEND)return"daily_post";
+    return"week_summary"; // 週五收盤後=本週總結
+  }
+  return"week_review";
+}
+
+// ── 單一 AI 分析函數（根據時間段自動切換模式）────────────────────────────────
+async function askClaude(wmd,wtrend,daily,positions,week2State,phase){
+  const hasLeaps=positions.some(p=>p.type==="long");
+  const posTxt=positions.length===0?"目前空倉。":
+    positions.map(p=>p.type==="long"
+      ?`Long LEAPS QQQ ${p.expiry} ${p.strike}C×${p.qty}，成本$${p.cost}，現值$${p.current}，Delta ${p.delta}`
+      :`Short Call QQQ ${p.expiry} ${p.strike}C×${p.qty}，賣出$${p.sell}，現值$${p.current}`
+    ).join("\n");
+
+  let news="";
+  try{const h=await fetchNews();if(h)news=`\n【市場新聞】\n${h}`;}catch{}
+
+  const stored=loadHistHistory();
+  const histNote=stored.length>=3
+    ?`\n【MACD Histogram近4週：${stored.map(h=>(h>=0?"+":"")+h.toFixed(2)).join(" → ")}】`:"";
+
+  const isWeekSummary=phase==="week_summary"||phase==="week_review";
+  const today=new Date().toISOString().split("T")[0];
+  const week2Note=week2State?"\n【持倉狀態】已半倉進場，本週是第二週確認週。":"";
+
+  // 週線數據區塊（兩種模式都用到）
+  const wkBlock=wmd?`
+═══ 週線數據（${isWeekSummary?"本週完整收盤":"上週基準"}）═══
+歷史位置：${wtrend.position.label}（52週百分位${wtrend.position.pct}%）
+距52週高點 ${wmd.fromHi52.toFixed(1)}%，距52週低點 +${wmd.fromLo52.toFixed(1)}%
+趨勢結構：${wtrend.structure.label}｜${wtrend.structure.detail}
+站穩週EMA20（$${wmd.ema20.toFixed(0)}）：${wmd.aboveE20?"是":"否"}，月漲幅：${wmd.monthly.toFixed(1)}%
+週MACD ${wmd.macd.toFixed(2)}（${wmd.macdExp?"擴張":"收窄"}），Hist ${wmd.histNow.toFixed(2)}
+週漲跌 ${wmd.weekly.toFixed(1)}%，RV ${wmd.volRatio.toFixed(2)}x
+收盤：$${wmd.price.toFixed(2)}｜EMA20：$${wmd.ema20.toFixed(0)}｜EMA40：$${wmd.ema40.toFixed(0)}
+底部確認條件：${wtrend.condCount}/5${histNote}`:"";
+
+  // 今日數據區塊
+  const dailyBlock=daily?`
+═══ 今日數據（${daily.todayLabel} ${daily.marketLabel||""}）═══
+現價：$${daily.price.toFixed(2)}（${daily.daily>=0?"+":""}${daily.daily.toFixed(2)}%）
+開：$${daily.open.toFixed(2)}  高：$${daily.high.toFixed(2)}  低：$${daily.low.toFixed(2)}
+日RV：${daily.dayRV.toFixed(2)}x｜K棒：${daily.candleType}
+日線EMA20：$${daily.e20d.toFixed(2)}（${daily.aboveE20d?"站穩":"跌破"}）`:"";
+
+  let prompt,systemPrompt;
+
+  if(isWeekSummary){
+    // ── 本週總結模式（週五收盤後 / 週六收盤前）──
+    prompt=`【本週總結分析｜${today}】
+${wkBlock}
+${week2Note}
+═══ 持倉 ═══
+${posTxt}
+${news}
+
+請完成本週完整五層分析（繁體中文，嚴禁使用 * ** # - 符號）：
+
+第一層｜歷史位置
+本週收盤在52週的哪個位置，風險程度如何。
+
+第二層｜趨勢結構
+本週趨勢是底部反轉、上升持續、頂部見頂還是下跌，依據是什麼。
+
+第三層｜動能確認
+本週MACD、漲幅、RV、EMA各自說明什麼，動能是否健康。
+
+第四層｜市場敘事
+本週真正的驅動力是什麼，可否持續，主要風險在哪，結合新聞。
+
+第五層｜情境預判
+若本週判斷正確，下週一到週五各會看到什麼信號？若錯誤，哪個數字第一個告訴你？
+
+下週操作計劃｜具體行動
+${!hasLeaps
+  ?"空倉：下週是否有進場條件？給出具體的行權價、資金、止損線。"
+  :week2State
+    ?"已半倉：下週是否達到加倉標準？給出明確的週一操作指令。"
+    :"持倉中：下週是情況A/B/C？給出下週各天的應對方案。"}
+
+一句話結論｜本週最重要的一個認知（20字以內）`;
+
+    systemPrompt=`你是資深趨勢交易員，20年LEAPS趨勢策略和週線分析經驗。
+
+策略框架v2.1：
+第一週信號→半倉（$8,000），止損本週低點
+第二週確認（週漲>2%且RV>0.8x）→全倉
+站上週EMA20→趨勢確認，全倉讓跑，禁止Short Call
+頂部確認：MACD Histogram急縮>50%或轉負＋放量下跌（RV>1.0x，週跌>1.5%）
+
+繁體中文，直接有力，讓交易者完全依賴此報告。嚴禁使用*#符號。`;
+
+  }else{
+    // ── 今日分析模式（週一到週五盤中/盤後）──
+    const phaseLabel=
+      phase==="daily_pre" ?"盤前":
+      phase==="daily_live"?"盤中":
+      phase==="daily_post"?"盤後":"";
+
+    prompt=`【今日分析｜${today}（${daily?.todayLabel||""}${phaseLabel?"·"+phaseLabel:""}）】
+${wkBlock}
+${dailyBlock}
+${week2Note}
+═══ 持倉 ═══
+${posTxt}
+${news}
+
+請完成今日合併分析（繁體中文，嚴禁使用 * ** # - 符號）：
+
+今日市場解讀｜今天發生了什麼？K棒和量能說明了什麼市場心理？結合新聞判斷驅動力。
+
+週線框架對比｜今日表現是否改變了上週基準判斷？是強化還是動搖了趨勢？
+
+今日操作信號｜是否觸發需要立即行動的信號（止損、加倉、離場）？若無，明確說「今日無需操作」。
+
+明日預判｜根據今日收盤，明日開盤最可能出現什麼情境？應注意什麼數字？
+
+一句話結論｜今天最重要的一個行動（20字以內）`;
+
+    systemPrompt=`你是資深趨勢交易員，20年LEAPS趨勢策略經驗。
+
+你的工作是每天把週線基準框架和今日日線數據合併分析，判斷今天是否需要採取行動。
+
+核心原則：週線基準是本週錨點，不輕易因單日改變。只有跌破止損線、頂部確認觸發、或政策催化重大信號才改變基準。
+
+每日核心問題只有一個：今天需要做什麼？大部分答案是「今日無需操作，維持基準」。
+
+繁體中文，直接有力，讓交易者完全依賴此報告。嚴禁使用*#符號。`;
+  }
+
+  const res=await fetch(WORKER_URL,{
+    method:"POST",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      model:"claude-sonnet-4-5",
+      max_tokens:isWeekSummary?1500:1200,
+      system:systemPrompt,
+      messages:[{role:"user",content:prompt}]
+    })
+  });
+  const d=await res.json();
+  if(!res.ok||d.error)throw new Error(typeof d.error==="object"?JSON.stringify(d.error):String(d.error||res.status));
+  return d.content?.[0]?.text;
+}
+
+// ── COLORS ────────────────────────────────────────────────────────────────────
+const C={
+  // 富途風格：深黑背景、白字、橙色主題
+  bg:"#0a0a0a",surf:"#141414",surf2:"#1a1a1a",surf3:"#1f1f1f",
+  border:"#2a2a2a",border2:"#333333",
+  // 主色：富途橙
+  gold:"#f5820a",goldDim:"rgba(245,130,10,0.12)",goldB:"rgba(245,130,10,0.3)",
+  // 漲：富途綠
+  green:"#0ecb81",greenDim:"rgba(14,203,129,0.08)",greenB:"rgba(14,203,129,0.2)",
+  // 跌：富途紅
+  red:"#f6465d",redDim:"rgba(246,70,93,0.08)",redB:"rgba(246,70,93,0.2)",
+  // 警示：橙黃
+  amber:"#f0a500",amberDim:"rgba(240,165,0,0.08)",amberB:"rgba(240,165,0,0.2)",
+  // 資訊：淺藍
+  blue:"#5dade2",blueDim:"rgba(93,173,226,0.08)",blueB:"rgba(93,173,226,0.2)",
+  // 文字：白色系
+  text:"#ffffff",dim:"#999999",muted:"#3a3a3a",
+};
+const CM={
+  green:[C.green,C.greenDim,C.greenB],amber:[C.amber,C.amberDim,C.amberB],
+  red:[C.red,C.redDim,C.redB],blue:[C.blue,C.blueDim,C.blueB],
+  gold:[C.gold,C.goldDim,C.goldB],muted:[C.muted,"rgba(42,56,72,0.15)",C.border],
+};
+const gc=n=>(CM[n]||CM.muted)[0];
+const gd=n=>(CM[n]||CM.muted)[1];
+const gb=n=>(CM[n]||CM.muted)[2];
+
+const DEC={
+  "半倉建倉":{c:"green",icon:"↗½"},
+  "加倉至全倉":{c:"green",icon:"↗↗"},
+  "持有半倉觀察":{c:"amber",icon:"½▶"},
+  "止損出場":{c:"red",icon:"✕"},
+  "持倉讓跑":{c:"gold",icon:"▶"},
+  "謹慎持有":{c:"amber",icon:"⚠"},
+  "頂部警戒":{c:"amber",icon:"⚠"},
+  "評估離場":{c:"red",icon:"↘"},
+  "假信號警告":{c:"red",icon:"✕"},
+  "收租觀察":{c:"blue",icon:"⊕"},
+  "觀察等待":{c:"muted",icon:"○"},
+};
+
+function SL({ch,mt}){
+  return(
+    <div style={{display:"flex",alignItems:"center",gap:10,margin:`${mt||16}px 0 10px`}}>
+      <div style={{fontSize:9,color:C.muted,letterSpacing:2,textTransform:"uppercase",
+        whiteSpace:"nowrap",fontFamily:"'JetBrains Mono',monospace"}}>{ch}</div>
+      <div style={{flex:1,height:1,background:C.border}}/>
+    </div>
+  );
+}
+
+function LayerCard({num,title,badge,badgeColor,children,collapsed,onToggle}){
+  return(
+    <div style={{background:C.surf,border:`1px solid ${C.border}`,borderRadius:8,marginBottom:8,overflow:"hidden"}}>
+      <div onClick={onToggle} style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+        padding:"12px 14px",cursor:"pointer"}}>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <div style={{fontSize:9,color:C.muted,fontFamily:"'JetBrains Mono',monospace",
+            background:C.surf2,padding:"2px 7px",borderRadius:3,letterSpacing:1}}>第{num}層</div>
+          <div style={{fontSize:13,fontWeight:700,color:C.text}}>{title}</div>
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:10}}>
+          <div style={{fontSize:12,fontWeight:700,color:gc(badgeColor)}}>{badge}</div>
+          <div style={{fontSize:10,color:C.muted}}>{collapsed?"▶":"▼"}</div>
+        </div>
+      </div>
+      {!collapsed&&<div style={{padding:"0 14px 14px"}}>{children}</div>}
+    </div>
+  );
+}
+
+function parseAnalysis(text){
+  if(!text)return[];
+  const segs=[];
+  const lines=text.split("\n").filter(l=>l.trim());
+  let cur=null;
+  const hdrs=["第一層","第二層","第三層","第四層","第五層","下週操作計劃","今日市場解讀","與基準對比","今日重要信號","明日預判","一句話結論"];
+  for(const line of lines){
+    const h=hdrs.find(h=>line.startsWith(h));
+    if(h){if(cur)segs.push(cur);cur={title:line.trim(),body:[]};}
+    else if(cur){cur.body.push(line.trim());}
+    else{segs.push({title:null,body:[line.trim()]});}
+  }
+  if(cur)segs.push(cur);
+  return segs;
+}
+
+function AnalysisBlock({text,source}){
+  const segs=parseAnalysis(text);
+  return(
+    <div>
+      {segs.map((seg,i)=>{
+        const isConclusion=seg.title&&seg.title.includes("一句話結論");
+        const isAction=seg.title&&(seg.title.includes("操作計劃")||seg.title.includes("重要信號"));
+        return(
+          <div key={i} style={{marginBottom:16}}>
+            {seg.title&&(
+              <div style={{fontSize:10,fontWeight:700,letterSpacing:1,marginBottom:8,
+                fontFamily:"'JetBrains Mono',monospace",textTransform:"uppercase",
+                color:isConclusion?C.gold:isAction?C.green:C.dim}}>
+                {seg.title}
+              </div>
+            )}
+            <div style={{
+              background:isConclusion?"rgba(240,165,0,0.06)":isAction?"rgba(0,200,150,0.04)":"transparent",
+              borderLeft:isConclusion?`3px solid ${C.gold}`:isAction?`3px solid ${C.green}`:"none",
+              borderRadius:isConclusion||isAction?6:0,
+              padding:isConclusion||isAction?"10px 14px":0,
+            }}>
+              {seg.body.map((line,j)=>(
+                <div key={j} style={{fontSize:13,color:isConclusion?C.text:C.dim,
+                  lineHeight:1.8,fontWeight:isConclusion?700:400,marginBottom:4}}>
+                  {line}
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+      {source==="offline"&&(
+        <div style={{fontSize:10,color:C.muted,fontFamily:"'JetBrains Mono',monospace",
+          marginTop:8,padding:"6px 10px",background:C.surf2,borderRadius:4}}>
+          ⚠️ AI連線失敗，以上為離線分析
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+function App(){
+  const[tab,setTab]=useState("today");
+  const[positions,setPositions]=useState(loadPos);
+  const[week2State,setWeek2State]=useState(loadWeek2);
+  const[weeklyBase,setWeeklyBase]=useState(loadWeeklyBase);
+  const[histHistory,setHistHistory]=useState(loadHistHistory);
+
+  // 單一分析狀態
+  const[wmd,setWmd]=useState(null);
+  const[wtrend,setWtrend]=useState(null);
+  const[daily,setDaily]=useState(null);
+  const[analysis,setAnalysis]=useState("");
+  const[analysisSource,setAnalysisSource]=useState("");
+  const[loading,setLoading]=useState(false);
+  const[loadStep,setLoadStep]=useState("");
+  const[aError,setAError]=useState("");
+  const[phase,setPhase]=useState("");
+
+  const[layerCollapsed,setLayerCollapsed]=useState({1:true,2:true,3:true,4:true,5:true});
+  const[toast,setToast]=useState("");
+  const[form,setForm]=useState({type:"long",strike:"",expiry:"",cost:"",current:"",sell:"",delta:"",qty:"1"});
+
+  const savePosState=p=>{savePos(p);setPositions(p)};
+  const saveWeek2State=w=>{saveWeek2(w);setWeek2State(w)};
+  const showToast=msg=>{setToast(msg);setTimeout(()=>setToast(""),2500)};
+  const hasLeaps=positions.some(p=>p.type==="long");
+  const toggleLayer=n=>setLayerCollapsed(s=>({...s,[n]:!s[n]}));
+
+  const now=new Date();
+  const ds=now.toLocaleDateString("zh-TW",{month:"numeric",day:"numeric",weekday:"short"});
+  const currentPhase=getMarketPhase();
+  const isWeekend=currentPhase==="week_review"||currentPhase==="week_summary";
+  const isWeekSummary=currentPhase==="week_summary";
+  const isWeekReview=currentPhase==="week_review";
+
+  // 按鈕標籤
+  const btnLabel=
+    currentPhase==="week_summary"?"本週總結":
+    currentPhase==="week_review" ?"上週回顧":
+    "今日分析";
+  const btnSub=
+    currentPhase==="week_summary"?"本週完整K + 下週操作計劃":
+    currentPhase==="week_review" ?"上週K線回顧 + 本週準備":
+    "週線基準 + 今日走勢 + 新聞";
+  const phaseLabel=
+    currentPhase==="daily_pre"   ?"盤前":
+    currentPhase==="daily_live"  ?"盤中":
+    currentPhase==="daily_post"  ?"盤後":
+    currentPhase==="week_summary"?"本週總結":
+    currentPhase==="week_review" ?"回顧":"";
+  const btnIcon=
+    currentPhase==="week_summary"?"📋":
+    currentPhase==="week_review" ?"📖":
+    "🔍";
+
+  // ── 單一分析入口 ──
+  const runAnalysis=useCallback(async()=>{
+    if(isWeekend)return;
+    setLoading(true);setAnalysis("");setAnalysisSource("");setAError("");
+    setLayerCollapsed({1:true,2:true,3:true,4:true,5:true});
+    const p=getMarketPhase();
+    setPhase(p);
+    try{
+      setLoadStep("抓取週線數據...");
+      const wData=await fetchWeeklyMarket();
+      const stored=loadHistHistory();
+      const merged=[...stored,wData.histNow].slice(-4);
+      saveHistHistory(merged);setHistHistory(merged);
+      wData.histHistory=merged;
+      setWmd(wData);
+
+      setLoadStep("三層分析中...");
+      const t=analyzeTrend(wData,week2State);
+      setWtrend(t);
+      if(t.decision==="半倉建倉"){saveWeek2(true);setWeek2State(true);showToast("已記住：下週第二週確認");}
+      else if(["加倉至全倉","止損出場","評估離場"].includes(t.decision)){saveWeek2(null);setWeek2State(null);}
+      saveLastDecision(t.decision);
+
+      // 非週末總結/回顧時，同時抓今日數據
+      let dayData=null;
+      if(p!=="week_summary"&&p!=="week_review"){
+        setLoadStep("抓取今日數據...");
+        try{dayData=await fetchDailyMarket();setDaily(dayData);}catch{}
+      }
+
+      setLoadStep("AI 分析中...");
+      const text=await askClaude(wData,t,dayData,positions,week2State,p);
+      if(text){
+        setAnalysis(text);setAnalysisSource("ai");
+        // 本週總結時儲存為下週基準
+        if(p==="week_summary"){
+          const base={decision:t.decision,price:wData.price,summary:text.substring(0,200),savedAt:new Date().toISOString()};
+          saveWeeklyBase(base);setWeeklyBase(base);
+        }
+      }else throw new Error("AI回傳空白");
+    }catch(e){
+      console.warn("Analysis error:",e.message);
+      setAError(e.message);
+    }
+    setLoadStep("");setLoading(false);
+  },[positions,week2State]);
+
+  const addPos=()=>{
+    const f=form;
+    const req=f.type==="long"?["strike","expiry","cost","current","delta"]:["strike","expiry","sell","current","delta"];
+    if(req.some(k=>!f[k])){showToast("請填寫所有必填欄位");return;}
+    const qty=+f.qty||1;
+    const p={id:Date.now(),type:f.type,strike:+f.strike,expiry:f.expiry,
+      current:+f.current,delta:+f.delta,qty,
+      cost:f.type==="long"?+f.cost:undefined,
+      sell:f.type==="short"?+f.sell:undefined};
+    savePosState([...positions,p]);
+    setForm({type:"long",strike:"",expiry:"",cost:"",current:"",sell:"",delta:"",qty:"1"});
+    showToast("倉位已新增");setTab("positions");
+  };
+
+  const netPnl=positions.reduce((s,p)=>
+    s+(p.type==="long"?(p.current-p.cost)*100*p.qty:(p.sell-p.current)*100*p.qty),0);
+
+  // ── TODAY PAGE ─────────────────────────────────────────────────────────────
+  const todayPage=(
+    <div style={{padding:"0 0 28px",overflowY:"auto",height:"100%"}}>
+      <div style={{padding:"16px 14px 0"}}>
+
+        {/* 休市提示 */}
+        {isWeekend&&(
+          <div style={{background:C.surf,border:`1px solid ${C.border}`,
+            borderRadius:8,padding:"12px 14px",marginBottom:12,fontSize:12,color:C.muted,textAlign:"center"}}>
+            美股休市中，可回顧分析或更新持倉數據
+          </div>
+        )}
+
+        {/* 本週基準 */}
+        {weeklyBase&&(
+          <div style={{background:C.surf,border:`1px solid ${C.border2}`,
+            borderRadius:8,padding:"12px 14px",marginBottom:12}}>
+            <div style={{fontSize:9,color:C.muted,letterSpacing:2,
+              fontFamily:"JetBrains Mono,monospace",marginBottom:6}}>上週基準決策</div>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <div style={{fontSize:14,fontWeight:700,
+                color:gc((DEC[weeklyBase.decision]||{c:"muted"}).c)}}>
+                {weeklyBase.decision}
+              </div>
+              <div style={{fontSize:10,color:C.muted,fontFamily:"JetBrains Mono,monospace"}}>
+                ${weeklyBase.price?.toFixed(0)||"—"} · {weeklyBase.savedAt
+                  ?new Date(weeklyBase.savedAt).toLocaleDateString("zh-TW",{month:"numeric",day:"numeric"}):"—"}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 單一分析按鈕 */}
+        <button onClick={runAnalysis} disabled={loading}
+          style={{width:"100%",padding:"20px 16px",marginBottom:16,
+            background:isWeekSummary
+              ?"linear-gradient(135deg,rgba(14,203,129,0.15),rgba(14,203,129,0.05))"
+              :isWeekReview
+              ?"linear-gradient(135deg,rgba(93,173,226,0.15),rgba(93,173,226,0.05))"
+              :"linear-gradient(135deg,rgba(245,130,10,0.18),rgba(245,130,10,0.06))",
+            border:`1px solid ${isWeekSummary?C.greenB:isWeekReview?C.blueB:C.goldB}`,
+            borderRadius:12,
+            color:isWeekSummary?C.green:isWeekReview?C.blue:C.gold,
+            cursor:"pointer",
+            display:"flex",flexDirection:"column",alignItems:"center",gap:8,
+            opacity:loading?0.5:1}}>
+          <div style={{fontSize:26}}>{btnIcon}</div>
+          <div style={{fontSize:16,fontWeight:900,letterSpacing:2}}>{btnLabel}</div>
+          <div style={{fontSize:11,opacity:0.7,lineHeight:1.5,textAlign:"center"}}>{btnSub}</div>
+          {phaseLabel&&(
+            <div style={{fontSize:10,padding:"3px 10px",borderRadius:12,
+              background:isWeekSummary?C.greenDim:isWeekReview?C.blueDim:C.goldDim,
+              border:`1px solid ${isWeekSummary?C.greenB:isWeekReview?C.blueB:C.goldB}`,
+              color:isWeekSummary?C.green:isWeekReview?C.blue:C.gold,
+              fontFamily:"JetBrains Mono,monospace",letterSpacing:1}}>
+              {phaseLabel}
+            </div>
+          )}
+        </button>
+
+        {/* 持倉狀態 */}
+        <div style={{background:C.surf,border:`1px solid ${C.border}`,borderRadius:10,padding:"14px"}}>
+          <div style={{fontSize:10,color:C.muted,letterSpacing:2,
+            fontFamily:"JetBrains Mono,monospace",marginBottom:8}}>持倉狀態</div>
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+            <div style={{fontSize:13,fontWeight:700,
+              color:hasLeaps?week2State?C.amber:C.green:C.gold}}>
+              {hasLeaps?week2State?"½ 半倉，等待確認":"✓ 持有 Long LEAPS（全倉）":"○ 空倉，持有 SGOV"}
+            </div>
+            <div style={{fontSize:11,color:C.muted,fontFamily:"JetBrains Mono,monospace"}}>
+              {positions.length===0?"無持倉":`${positions.filter(p=>p.type==="long").length}L · ${positions.filter(p=>p.type==="short").length}S`}
+            </div>
+          </div>
+          {hasLeaps&&(
+            <div style={{marginTop:10,display:"flex",gap:8}}>
+              {[{v:null,l:"全倉"},{v:true,l:"半倉（等第二週）"}].map(o=>(
+                <button key={String(o.v)} onClick={()=>saveWeek2State(o.v)}
+                  style={{flex:1,padding:"7px",borderRadius:6,cursor:"pointer",fontSize:11,
+                    border:week2State===o.v?`1px solid ${C.amber}`:`1px solid ${C.border}`,
+                    background:week2State===o.v?C.amberDim:"transparent",
+                    color:week2State===o.v?C.amber:C.muted}}>
+                  {o.l}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 載入中 */}
+      {loading&&(
+        <div style={{padding:"16px 14px 0"}}>
+          <div style={{background:C.surf,border:`1px solid ${isWeekSummary?C.greenB:C.goldB}`,
+            borderRadius:12,padding:"28px 20px",textAlign:"center"}}>
+            <div style={{fontSize:24,marginBottom:12,animation:"pulse 1.2s infinite"}}>
+              {isWeekSummary?"📋":"🔍"}
+            </div>
+            <div style={{fontSize:13,color:isWeekSummary?C.green:C.gold,fontWeight:700,marginBottom:6}}>
+              {loadStep}
+            </div>
+            <div style={{fontSize:11,color:C.muted,fontFamily:"JetBrains Mono,monospace"}}>
+              {isWeekSummary?"本週總結分析中...":"合併分析中..."}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* 錯誤顯示 */}
+      {aError&&!loading&&(
+        <div style={{padding:"16px 14px 0"}}>
+          <div style={{background:C.redDim,border:`1px solid ${C.redB}`,borderRadius:10,padding:"16px"}}>
+            <div style={{fontSize:12,color:C.red,fontWeight:700,marginBottom:8}}>⚠️ 分析失敗</div>
+            <div style={{fontSize:11,color:C.dim,fontFamily:"JetBrains Mono,monospace",
+              lineHeight:1.6,marginBottom:12,wordBreak:"break-all"}}>{aError}</div>
+            <div style={{fontSize:10,color:C.blue,fontFamily:"JetBrains Mono,monospace",
+              background:C.surf2,padding:"8px 10px",borderRadius:5,wordBreak:"break-all",marginBottom:8}}>
+              https://pmcc-proxy.lyupong.workers.dev/market/live
+            </div>
+            <div style={{fontSize:11,color:C.muted,marginBottom:12}}>
+              若看到含 price 的 JSON 則數據正常，問題在 ANTHROPIC_API_KEY。
+            </div>
+            <button onClick={runAnalysis}
+              style={{width:"100%",padding:"10px",background:C.goldDim,
+                border:`1px solid ${C.goldB}`,borderRadius:6,color:C.gold,
+                fontSize:13,fontWeight:700,cursor:"pointer"}}>
+              重新嘗試
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* ── 分析結果 ── */}
+      {wtrend&&wmd&&!loading&&(
+        <div className="fade-in">
+
+          {/* HERO */}
+          <div style={{padding:"0 14px",marginTop:16}}>
+            {(()=>{
+              const decSt=DEC[wtrend.decision]||{c:"muted",icon:"○"};
+              return(
+                <div style={{
+                  background:`linear-gradient(160deg,${gd(decSt.c)},rgba(10,10,10,0.95))`,
+                  border:`1px solid ${gb(decSt.c)}`,borderRadius:12,padding:"18px 16px",marginBottom:14,
+                }}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+                    <div style={{display:"flex",alignItems:"center",gap:8}}>
+                      <div style={{fontSize:9,color:gc(decSt.c),letterSpacing:3,
+                        fontFamily:"JetBrains Mono,monospace",fontWeight:700,opacity:0.8}}>
+                        {phase==="week_summary"?"本週總結":"週線+今日"}
+                      </div>
+                      {wtrend.positionSize&&(
+                        <div style={{fontSize:9,padding:"2px 8px",borderRadius:3,
+                          fontFamily:"JetBrains Mono,monospace",fontWeight:700,
+                          background:wtrend.positionSize==="全倉"?C.greenDim:C.amberDim,
+                          color:wtrend.positionSize==="全倉"?C.green:C.amber,
+                          border:`1px solid ${wtrend.positionSize==="全倉"?C.greenB:C.amberB}`}}>
+                          {wtrend.positionSize}
+                        </div>
+                      )}
+                    </div>
+                    <button onClick={runAnalysis}
+                      style={{background:"transparent",border:`1px solid ${gb(decSt.c)}`,
+                        borderRadius:5,padding:"3px 9px",color:gc(decSt.c),fontSize:10,
+                        fontFamily:"JetBrains Mono,monospace",cursor:"pointer",opacity:0.7}}>
+                      重新分析
+                    </button>
+                  </div>
+
+                  {/* 週次提示條 */}
+                  {wmd.isCurrentWeekOpen&&(
+                    <div style={{display:"flex",alignItems:"center",gap:8,
+                      background:"rgba(93,173,226,0.08)",border:"1px solid rgba(93,173,226,0.2)",
+                      borderRadius:6,padding:"6px 10px",marginBottom:10}}>
+                      <div style={{fontSize:10,color:C.blue,fontFamily:"JetBrains Mono,monospace",fontWeight:700}}>
+                        {wmd.todayLabel}
+                      </div>
+                      <div style={{width:1,height:10,background:"rgba(93,173,226,0.3)"}}/>
+                      <div style={{fontSize:10,color:C.dim}}>
+                        主分析基準為上週收盤（${wmd.price.toFixed(0)}）
+                      </div>
+                      {wmd.thisWeek&&(
+                        <div style={{marginLeft:"auto",fontSize:10,fontFamily:"JetBrains Mono,monospace",
+                          color:wmd.thisWeek.chg>=0?C.green:C.red,whiteSpace:"nowrap"}}>
+                          今 ${wmd.thisWeek.price.toFixed(1)} {wmd.thisWeek.chg>=0?"+":""}{wmd.thisWeek.chg.toFixed(1)}%
+                          {wmd.thisWeek.updatedAt&&<span style={{color:C.muted,fontSize:8,marginLeft:4}}>{wmd.thisWeek.updatedAt}</span>}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* 今日數據快覽（非週末總結時顯示） */}
+                  {daily&&phase!=="week_summary"&&(
+                    <div style={{display:"flex",alignItems:"center",gap:10,
+                      background:"rgba(255,255,255,0.04)",borderRadius:6,
+                      padding:"8px 12px",marginBottom:10}}>
+                      <div style={{fontSize:20,fontWeight:900,color:C.text,fontFamily:"JetBrains Mono,monospace"}}>
+                        ${daily.price.toFixed(2)}
+                      </div>
+                      <div style={{fontSize:13,color:daily.daily>=0?C.green:C.red,fontFamily:"JetBrains Mono,monospace"}}>
+                        {daily.daily>=0?"+":""}{daily.daily.toFixed(2)}%
+                      </div>
+                      <div style={{fontSize:10,color:C.muted,fontFamily:"JetBrains Mono,monospace"}}>
+                        RV {daily.dayRV.toFixed(2)}x · {daily.candleType}
+                      </div>
+                      <div style={{marginLeft:"auto",fontSize:10,
+                        fontFamily:"JetBrains Mono,monospace",
+                        color:daily.isMarketOpen?C.green:daily.isPostMarket||daily.isPreMarket?C.amber:C.muted,
+                        background:daily.isMarketOpen?C.greenDim:daily.isPostMarket||daily.isPreMarket?C.amberDim:"transparent",
+                        padding:"2px 8px",borderRadius:4}}>
+                        {daily.marketLabel||"休市"}
+                      </div>
+                    </div>
+                  )}
+
+                  <div style={{display:"flex",alignItems:"baseline",gap:12,marginBottom:6}}>
+                    <div style={{fontSize:32,fontWeight:900,color:gc(decSt.c),lineHeight:1,letterSpacing:-1}}>
+                      {wtrend.decision}
+                    </div>
+                    <div style={{fontSize:18,color:gc(decSt.c),opacity:0.7}}>{decSt.icon}</div>
+                  </div>
+
+                  <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:10}}>
+                    <span style={{fontSize:16,fontWeight:700,color:C.text,fontFamily:"JetBrains Mono,monospace"}}>
+                      ${wmd.price.toFixed(2)}
+                    </span>
+                    <span style={{fontSize:12,color:wmd.weekly>=0?C.green:C.red,fontFamily:"JetBrains Mono,monospace"}}>
+                      {wmd.weekly>=0?"+":""}{wmd.weekly.toFixed(2)}%
+                    </span>
+                    <span style={{fontSize:11,color:C.muted,fontFamily:"JetBrains Mono,monospace"}}>
+                      百分位{wmd.histPct}%
+                    </span>
+                  </div>
+
+                  {wtrend.condCount>0&&(
+                    <div style={{marginBottom:8}}>
+                      <div style={{fontSize:9,color:C.muted,fontFamily:"JetBrains Mono,monospace",marginBottom:5}}>
+                        底部確認條件 {wtrend.condCount}/5
+                      </div>
+                      <div style={{display:"flex",gap:4}}>
+                        {[0,1,2,3,4].map(i=>(
+                          <div key={i} style={{flex:1,height:3,borderRadius:2,
+                            background:i<wtrend.condCount?C.green:C.muted}}/>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {wtrend.isFakeSignal&&(
+                    <div style={{background:C.redDim,border:`1px solid ${C.redB}`,
+                      borderRadius:6,padding:"6px 12px",fontSize:12,color:C.red,fontWeight:700}}>
+                      ⚠️ 量價背離：大量推不動，假信號
+                    </div>
+                  )}
+                  {wtrend.isTopWarningVol&&(
+                    <div style={{background:C.redDim,border:`1px solid ${C.redB}`,
+                      borderRadius:6,padding:"6px 12px",fontSize:12,color:C.red,fontWeight:700}}>
+                      ⚠️ 高位量縮：RV={wmd.volRatio.toFixed(2)}x，頂部警示
+                    </div>
+                  )}
+                  {week2State&&(
+                    <div style={{background:C.amberDim,border:`1px solid ${C.amberB}`,
+                      borderRadius:6,padding:"6px 12px",fontSize:11,color:C.amber,
+                      fontFamily:"JetBrains Mono,monospace",marginTop:8}}>
+                      ½ 上週已半倉進場，本週是第二週確認週
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+          </div>
+
+          {/* 操作步驟 */}
+          <div style={{padding:"0 14px"}}>
+            <div style={{fontSize:10,color:C.muted,letterSpacing:2,
+              fontFamily:"JetBrains Mono,monospace",marginBottom:10,textTransform:"uppercase"}}>
+              執行步驟
+            </div>
+            {wtrend.actionSteps.map((step,i)=>{
+              const isAlert=step.icon==="!";
+              const isCheck=step.check===true;
+              const isFail=step.check===false;
+              const borderCol=isAlert?C.red:isCheck?C.green:isFail?C.amber:C.border2;
+              const bgCol=isAlert?C.redDim:isCheck?C.greenDim:"transparent";
+              return(
+                <div key={i} style={{display:"flex",alignItems:"flex-start",gap:12,
+                  background:bgCol,border:`1px solid ${borderCol}`,
+                  borderRadius:8,padding:"12px 14px",marginBottom:8}}>
+                  <div style={{width:24,height:24,borderRadius:"50%",flexShrink:0,
+                    display:"flex",alignItems:"center",justifyContent:"center",
+                    fontSize:11,fontWeight:900,fontFamily:"JetBrains Mono,monospace",
+                    background:isAlert?C.red:isCheck?C.greenDim:isFail?C.amberDim:C.surf2,
+                    color:isAlert?"#000":isCheck?C.green:isFail?C.amber:C.muted,
+                    border:`1px solid ${isAlert?C.red:isCheck?C.greenB:isFail?C.amberB:C.border}`}}>
+                    {isCheck?"✓":isFail?"!":step.icon}
+                  </div>
+                  <div style={{fontSize:13,color:C.text,lineHeight:1.6,fontWeight:isAlert?700:400}}>
+                    {step.text}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* AI 分析報告 */}
+          {analysis&&(
+            <div style={{padding:"8px 14px 0"}}>
+              <div style={{display:"flex",alignItems:"center",gap:10,margin:"16px 0 10px"}}>
+                <div style={{fontSize:9,color:C.muted,letterSpacing:2,textTransform:"uppercase",
+                  whiteSpace:"nowrap",fontFamily:"JetBrains Mono,monospace"}}>
+                  {phase==="week_summary"?"本週總結分析":"今日合併分析"}
+                  {analysisSource==="offline"?" · 離線":""}
+                </div>
+                <div style={{flex:1,height:1,background:C.border}}/>
+              </div>
+              <AnalysisBlock text={analysis} source={analysisSource}/>
+            </div>
+          )}
+
+          {/* 三層技術數據 */}
+          <div style={{padding:"4px 14px 0"}}>
+            <div style={{display:"flex",alignItems:"center",gap:10,margin:"16px 0 10px"}}>
+              <div style={{fontSize:9,color:C.muted,letterSpacing:2,textTransform:"uppercase",
+                whiteSpace:"nowrap",fontFamily:"JetBrains Mono,monospace"}}>週線技術數據</div>
+              <div style={{flex:1,height:1,background:C.border}}/>
+            </div>
+
+            <LayerCard num="一" title="歷史位置" badge={wtrend.position.label}
+              badgeColor={wtrend.position.color} collapsed={layerCollapsed[1]} onToggle={()=>toggleLayer(1)}>
+              <div style={{position:"relative",height:8,background:C.surf2,borderRadius:4,marginBottom:10}}>
+                <div style={{position:"absolute",inset:0,borderRadius:4,
+                  background:"linear-gradient(90deg,#0ecb81,#f5820a,#f6465d)",opacity:0.25}}/>
+                <div style={{position:"absolute",top:0,bottom:0,left:0,width:`${wtrend.position.pct}%`,
+                  borderRadius:4,background:"linear-gradient(90deg,#0ecb81,#f5820a,#f6465d)"}}/>
+                <div style={{position:"absolute",top:-4,width:14,height:14,borderRadius:"50%",
+                  background:C.bg,border:`2px solid ${gc(wtrend.position.color)}`,
+                  left:`calc(${Math.min(wtrend.position.pct,97)}% - 7px)`,
+                  boxShadow:`0 0 8px ${gc(wtrend.position.color)}`}}/>
+              </div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6}}>
+                {[
+                  {l:"52週百分位",v:`${wtrend.position.pct}%`},
+                  {l:"距52週高點",v:`${wmd.fromHi52.toFixed(1)}%`},
+                  {l:"距52週低點",v:`+${wmd.fromLo52.toFixed(1)}%`},
+                ].map(d=>(
+                  <div key={d.l} style={{background:C.surf2,borderRadius:5,padding:"7px 8px",textAlign:"center"}}>
+                    <div style={{fontSize:9,color:C.muted,marginBottom:3}}>{d.l}</div>
+                    <div style={{fontSize:13,fontWeight:700,color:C.text,fontFamily:"JetBrains Mono,monospace"}}>{d.v}</div>
+                  </div>
+                ))}
+              </div>
+            </LayerCard>
+
+            <LayerCard num="二" title="趨勢結構（週線）" badge={wtrend.structure.label}
+              badgeColor={wtrend.structure.color} collapsed={layerCollapsed[2]} onToggle={()=>toggleLayer(2)}>
+              <div style={{fontSize:12,color:C.dim,marginBottom:10,lineHeight:1.7}}>{wtrend.structure.detail}</div>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
+                {[
+                  {l:"站穩週EMA20",v:wmd.aboveE20?"✓ 是":"✗ 否",ok:wmd.aboveE20},
+                  {l:"站穩週EMA40",v:wmd.aboveE40?"✓ 是":"✗ 否",ok:wmd.aboveE40},
+                  {l:"週線連漲",v:wmd.wk2Up?"✓ 確認":"✗ 未確認",ok:wmd.wk2Up},
+                  {l:"月線方向",v:wmd.monthTrend==="up"?"↑ 向上":wmd.monthTrend==="down"?"↓ 向下":"→ 橫盤",ok:wmd.monthTrend==="up"},
+                ].map(d=>(
+                  <div key={d.l} style={{background:C.surf2,borderRadius:5,padding:"7px 10px",
+                    display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <div style={{fontSize:11,color:C.muted}}>{d.l}</div>
+                    <div style={{fontSize:11,fontWeight:700,color:d.ok?C.green:C.red,
+                      fontFamily:"JetBrains Mono,monospace"}}>{d.v}</div>
+                  </div>
+                ))}
+              </div>
+            </LayerCard>
+
+            <LayerCard num="三" title="動能確認（週線）" badge={wtrend.momentum.label}
+              badgeColor={wtrend.momentum.color} collapsed={layerCollapsed[3]} onToggle={()=>toggleLayer(3)}>
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,marginBottom:8}}>
+                {[
+                  {l:"上週漲幅",v:`${wmd.weekly.toFixed(1)}%`,ok:wmd.weekly>2},
+                  {l:"月漲幅",v:`${wmd.monthly.toFixed(1)}%`,ok:wmd.monthly>5},
+                  {l:"週MACD",v:wmd.macdExp&&wmd.macd>0?"擴張偏多":wmd.macd>0?"偏多":"偏空",ok:wmd.macdExp&&wmd.macd>0},
+                  {l:"週RV",v:`${wmd.volRatio.toFixed(2)}x`,ok:wmd.volRatio>1.0},
+                ].map(d=>(
+                  <div key={d.l} style={{background:C.surf2,borderRadius:5,padding:"7px 10px",
+                    display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <div style={{fontSize:11,color:C.muted}}>{d.l}</div>
+                    <div style={{fontSize:11,fontWeight:700,fontFamily:"JetBrains Mono,monospace",
+                      color:d.ok?C.green:C.text}}>{d.v}</div>
+                  </div>
+                ))}
+              </div>
+              {/* Histogram 4週趨勢 */}
+              <div style={{background:C.surf2,borderRadius:5,padding:"8px 10px"}}>
+                <div style={{fontSize:9,color:C.muted,marginBottom:8,
+                  fontFamily:"JetBrains Mono,monospace",letterSpacing:1}}>MACD HISTOGRAM 趨勢（近4週）</div>
+                {(()=>{
+                  const hist=histHistory.length>=2?histHistory:[wmd.histPrev,wmd.histNow];
+                  const maxAbs=Math.max(...hist.map(h=>Math.abs(h||0)),0.001);
+                  const shrinkPct=hist.length>=2&&hist.at(-2)!==0
+                    ?Math.abs((hist.at(-1)-hist.at(-2))/hist.at(-2))*100:0;
+                  const isShrinking=hist.at(-1)<hist.at(-2);
+                  const labels=hist.length===4?["-3週","-2週","上週","本週"]:
+                    hist.length===3?["-2週","上週","本週"]:["-1週","本週"];
+                  return(
+                    <div>
+                      <div style={{display:"flex",alignItems:"flex-end",gap:4,height:40,marginBottom:6}}>
+                        {hist.map((h,i)=>{
+                          const pct=Math.abs(h||0)/maxAbs;
+                          const isPos=(h||0)>=0;
+                          const isLast=i===hist.length-1;
+                          return(
+                            <div key={i} style={{flex:1,display:"flex",flexDirection:"column",
+                              alignItems:"center",justifyContent:"flex-end",height:"100%"}}>
+                              <div style={{width:"100%",height:`${Math.max(pct*36,2)}px`,
+                                background:isPos?(isLast?C.green:"rgba(14,203,129,0.35)"):(isLast?C.red:"rgba(246,70,93,0.35)"),
+                                borderRadius:2,border:isLast?`1px solid ${isPos?C.green:C.red}`:"none"}}/>
+                            </div>
+                          );
+                        })}
+                      </div>
+                      <div style={{display:"flex",gap:4}}>
+                        {hist.map((h,i)=>(
+                          <div key={i} style={{flex:1,textAlign:"center",fontSize:8,
+                            color:C.muted,fontFamily:"JetBrains Mono,monospace"}}>{labels[i]||""}</div>
+                        ))}
+                      </div>
+                      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:6}}>
+                        <div style={{fontSize:11,fontWeight:700,
+                          color:(wmd.histNow||0)>0?C.green:C.red,fontFamily:"JetBrains Mono,monospace"}}>
+                          {(wmd.histNow||0).toFixed(3)}
+                        </div>
+                        <div style={{fontSize:10,color:shrinkPct>50?C.red:shrinkPct>25?C.amber:C.muted,
+                          fontFamily:"JetBrains Mono,monospace"}}>
+                          {isShrinking?`↓收窄${shrinkPct.toFixed(0)}%`:`↑擴張${shrinkPct.toFixed(0)}%`}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+              {/* 本週即時補充 */}
+              {wmd.thisWeek&&(
+                <div style={{marginTop:8,background:"rgba(93,173,226,0.06)",
+                  border:"1px solid rgba(93,173,226,0.15)",borderRadius:5,padding:"8px 10px"}}>
+                  <div style={{fontSize:9,color:C.blue,marginBottom:6,
+                    fontFamily:"JetBrains Mono,monospace",letterSpacing:1}}>
+                    本週截至{wmd.todayLabel}（{wmd.thisWeek.volRatioSource}）
+                  </div>
+                  <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6}}>
+                    {[
+                      {l:"今日價格",v:`$${wmd.thisWeek.price.toFixed(2)}`,
+                        sub:`本週${wmd.thisWeek.chg>=0?"+":""}${wmd.thisWeek.chg.toFixed(1)}%`},
+                      {l:"今日RV",v:wmd.thisWeek.volRatio!=null?`${wmd.thisWeek.volRatio.toFixed(2)}x`:"—",
+                        sub:"vs 20週均量"},
+                    ].map(d=>(
+                      <div key={d.l}>
+                        <div style={{fontSize:9,color:C.muted,marginBottom:2}}>{d.l}</div>
+                        <div style={{fontSize:13,fontWeight:700,color:C.blue,fontFamily:"JetBrains Mono,monospace"}}>{d.v}</div>
+                        <div style={{fontSize:9,color:C.muted}}>{d.sub}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </LayerCard>
+
+            {/* 空倉建倉參考 */}
+            {!hasLeaps&&(
+              <div style={{background:C.surf3,border:`1px solid ${C.border}`,borderRadius:10,padding:"14px",marginTop:4}}>
+                <div style={{fontSize:10,color:C.gold,letterSpacing:2,fontFamily:"JetBrains Mono,monospace",
+                  marginBottom:10,fontWeight:700}}>LEAPS 建倉參考</div>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+                  {[
+                    {l:"半倉行權價",v:`$${Math.round(wmd.price*0.82/5)*5}–$${Math.round(wmd.price*0.85/5)*5}`,s:"現價80-85%，Delta≈0.75"},
+                    {l:"半倉資金",v:"$8,000",s:"第一週信號，等第二週確認"},
+                    {l:"到期日",v:"12–18 個月",s:"低位選18個月緩衝充足"},
+                    {l:"週EMA20",v:`$${wmd.ema20.toFixed(0)}`,s:"站穩此位=趨勢確認"},
+                  ].map(d=>(
+                    <div key={d.l} style={{background:C.surf2,borderRadius:6,padding:"10px 12px"}}>
+                      <div style={{fontSize:9,color:C.muted,marginBottom:4}}>{d.l}</div>
+                      <div style={{fontSize:14,fontWeight:700,color:C.text}}>{d.v}</div>
+                      <div style={{fontSize:10,color:C.muted,marginTop:2,lineHeight:1.4}}>{d.s}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
+  const posPage=(
+    <div style={{padding:"14px 14px 24px",overflowY:"auto",height:"100%"}}>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:14}}>
+        <div style={{background:C.surf,border:`1px solid ${C.border}`,borderRadius:8,padding:"14px 12px"}}>
+          <div style={{fontSize:10,color:C.muted,marginBottom:6,fontFamily:"'JetBrains Mono',monospace"}}>組合淨值</div>
+          <div style={{fontSize:24,fontWeight:900,
+            color:netPnl>0?C.green:netPnl<0?C.red:C.gold}}>
+            {netPnl>=0?"+":""}${Math.abs(netPnl).toFixed(0)}
+          </div>
+        </div>
+        <div style={{background:C.surf,border:`1px solid ${C.border}`,borderRadius:8,padding:"14px 12px"}}>
+          <div style={{fontSize:10,color:C.muted,marginBottom:6,fontFamily:"'JetBrains Mono',monospace"}}>持倉狀態</div>
+          <div style={{fontSize:16,fontWeight:900,color:hasLeaps?week2State?C.amber:C.green:C.gold}}>
+            {hasLeaps?week2State?"½ 半倉":"全倉":"空倉"}
+          </div>
+        </div>
+      </div>
+      <SL ch="當前持倉" mt={4}/>
+      {positions.length===0?(
+        <div style={{textAlign:"center",padding:"48px 20px",color:C.muted,fontSize:13,lineHeight:2.2}}>
+          尚未新增持倉<br/>前往「新增」頁面
+        </div>
+      ):positions.map(p=>{
+        const pnl=p.type==="long"?(p.current-p.cost)*100*p.qty:(p.sell-p.current)*100*p.qty;
+        const pct=p.type==="long"?((p.current-p.cost)/p.cost*100):((p.sell-p.current)/p.sell*100);
+        let ac=C.green,am="";
+        if(p.type==="long"){am=`持有中 · Delta ${p.delta} · 每漲$10賺$${(p.delta*1000*p.qty).toFixed(0)}`;}
+        else{
+          const buf=wmd?((p.strike-wmd.price)/wmd.price*100).toFixed(1):null;
+          if(buf!==null&&+buf<2){ac=C.red;am=`🔴 緩衝僅${buf}%，評估Roll`;}
+          else{am=`50%獲利$${(p.sell*0.5).toFixed(2)} · 停損$${(p.sell*2).toFixed(2)}`;}
+        }
+        return(
+          <div key={p.id} style={{background:C.surf,border:`1px solid ${C.border}`,borderRadius:10,padding:"16px 14px",marginBottom:10}}>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:12}}>
+              <div>
+                <div style={{fontSize:10,fontWeight:700,letterSpacing:1.5,padding:"3px 8px",borderRadius:4,
+                  display:"inline-block",fontFamily:"'JetBrains Mono',monospace",
+                  background:p.type==="long"?C.greenDim:C.redDim,color:p.type==="long"?C.green:C.red,
+                  border:`1px solid ${p.type==="long"?C.greenB:C.redB}`}}>
+                  {p.type==="long"?`LONG LEAPS${p.qty<1?" ½":""}` :"SHORT CALL"}
+                </div>
+                <div style={{fontSize:15,fontWeight:700,color:C.text,marginTop:7,fontFamily:"'JetBrains Mono',monospace"}}>
+                  QQQ {p.expiry} {p.strike}C × {p.qty}
+                </div>
+              </div>
+              <div style={{textAlign:"right"}}>
+                <div style={{fontSize:24,fontWeight:900,color:pnl>=0?C.green:C.red}}>
+                  {pnl>=0?"+":""}${Math.abs(pnl).toFixed(0)}
+                </div>
+                <div style={{fontSize:11,color:C.muted,fontFamily:"'JetBrains Mono',monospace"}}>
+                  {pnl>=0?"+":""}{pct.toFixed(1)}%
+                </div>
+              </div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:7,marginBottom:10}}>
+              {[
+                {l:p.type==="long"?"成本":"賣出價",v:`$${p.type==="long"?p.cost:p.sell}`},
+                {l:"現值",v:`$${p.current}`},
+                {l:"Delta",v:String(p.delta)},
+              ].map(d=>(
+                <div key={d.l} style={{background:C.surf2,borderRadius:6,padding:"8px 10px"}}>
+                  <div style={{fontSize:9,color:C.muted,marginBottom:4}}>{d.l}</div>
+                  <div style={{fontSize:13,fontWeight:600,color:C.text,fontFamily:"'JetBrains Mono',monospace"}}>{d.v}</div>
+                </div>
+              ))}
+            </div>
+            <div style={{padding:"9px 12px",borderRadius:6,fontSize:12,fontFamily:"'JetBrains Mono',monospace",
+              borderLeft:`3px solid ${ac}`,background:`${ac}10`,color:ac}}>{am}</div>
+            <button onClick={()=>{savePosState(positions.filter(x=>x.id!==p.id));showToast("已刪除");}}
+              style={{width:"100%",marginTop:10,padding:"8px",background:"transparent",
+                border:`1px solid ${C.border}`,borderRadius:6,color:C.muted,fontSize:11,cursor:"pointer"}}>
+              刪除此倉位
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+
+  // ── ADD PAGE ───────────────────────────────────────────────────────────────
+  const addPage=(
+    <div style={{padding:"14px 14px 24px",overflowY:"auto",height:"100%"}}>
+      <div style={{background:C.surf,border:`1px solid ${C.border}`,borderRadius:10,padding:"18px 14px",marginBottom:12}}>
+        <div style={{fontSize:12,color:C.gold,letterSpacing:2,textTransform:"uppercase",
+          marginBottom:14,fontWeight:700,fontFamily:"'JetBrains Mono',monospace"}}>新增倉位</div>
+        <div style={{display:"flex",gap:8,marginBottom:16}}>
+          {["long","short"].map(t=>(
+            <button key={t} onClick={()=>setForm(f=>({...f,type:t}))}
+              style={{flex:1,padding:"11px",borderRadius:6,cursor:"pointer",fontSize:13,fontWeight:700,
+                border:form.type===t?`1px solid ${C.gold}`:`1px solid ${C.border}`,
+                background:form.type===t?C.goldDim:"transparent",
+                color:form.type===t?C.gold:C.muted}}>
+              {t==="long"?"Long LEAPS":"Short Call"}
+            </button>
+          ))}
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
+          {[
+            {k:"strike",l:"行權價",p:"515"},
+            {k:"expiry",l:"到期日 YYMMDD",p:"270117"},
+            {k:form.type==="long"?"cost":"sell",l:form.type==="long"?"買入成本":"賣出價格",p:"124.72"},
+            {k:"current",l:"現值",p:"226.05"},
+            {k:"delta",l:"Delta",p:"0.75"},
+            {k:"qty",l:"張數（半倉填0.5）",p:"0.5"},
+          ].map(f=>(
+            <div key={f.k}>
+              <div style={{fontSize:10,color:C.muted,marginBottom:6,fontFamily:"'JetBrains Mono',monospace"}}>{f.l}</div>
+              <input type="number" step="any" placeholder={f.p} value={form[f.k]||""}
+                onChange={e=>setForm(prev=>({...prev,[f.k]:e.target.value}))}
+                style={{width:"100%",background:C.surf2,border:`1px solid ${C.border2}`,borderRadius:6,
+                  padding:"12px",color:C.text,fontSize:15,fontWeight:700,outline:"none"}}/>
+            </div>
+          ))}
+        </div>
+        <button onClick={addPos}
+          style={{width:"100%",padding:15,background:`linear-gradient(135deg,${C.gold},#c8841a)`,
+            border:"none",borderRadius:8,color:"#000",fontSize:14,fontWeight:900,letterSpacing:2,cursor:"pointer"}}>
+          新增
+        </button>
+      </div>
+      <div style={{background:C.surf,border:`1px solid ${C.border}`,borderRadius:8,padding:"14px"}}>
+        <div style={{fontSize:10,color:C.muted,letterSpacing:1,marginBottom:10,
+          fontFamily:"'JetBrains Mono',monospace",textTransform:"uppercase"}}>填寫提示</div>
+        {["半倉進場時張數填 0.5，全倉填 1","到期日格式：270117 = 2027年01月17日","現值每週更新讓 P&L 保持準確"].map((t,i)=>(
+          <div key={i} style={{fontSize:12,color:C.dim,paddingLeft:12,position:"relative",marginBottom:6}}>
+            <span style={{position:"absolute",left:0,color:C.muted}}>·</span>{t}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
+  return(
+    <div style={{background:C.bg,maxWidth:430,margin:"0 auto",display:"flex",flexDirection:"column",
+      height:"100dvh",overflow:"hidden"}}>
+      <div style={{background:"rgba(7,9,12,0.97)",backdropFilter:"blur(12px)",
+        padding:"16px 16px 12px",borderBottom:`1px solid ${C.border}`,
+        display:"flex",justifyContent:"space-between",alignItems:"center",flexShrink:0,
+        paddingTop:"max(16px,env(safe-area-inset-top,16px))"}}>
+        <div>
+          <div style={{fontSize:18,fontWeight:900,color:C.text,letterSpacing:1}}>PMCC ADVISOR</div>
+          <div style={{fontSize:10,color:C.muted,marginTop:2,letterSpacing:1,
+            fontFamily:"'JetBrains Mono',monospace"}}>週線策略 v3.1</div>
+        </div>
+        <div style={{textAlign:"right"}}>
+          <div style={{fontSize:11,color:C.muted,fontFamily:"'JetBrains Mono',monospace"}}>{ds}</div>
+          <div style={{fontSize:10,marginTop:2,fontFamily:"'JetBrains Mono',monospace",
+            color:hasLeaps?week2State?C.amber:C.green:C.gold}}>
+            {hasLeaps?week2State?"½ 半倉":"全倉持有":"空倉"}
+          </div>
+        </div>
+      </div>
+
+      <div style={{display:"flex",background:"#0d1018",borderBottom:`1px solid ${C.border}`,flexShrink:0}}>
+        {[["today","分析"],["positions","持倉"],["add","新增"]].map(([id,lbl])=>(
+          <div key={id} onClick={()=>setTab(id)}
+            style={{flex:1,padding:"13px 8px",textAlign:"center",fontSize:13,
+              fontWeight:tab===id?700:400,color:tab===id?C.gold:C.muted,
+              borderBottom:tab===id?`2px solid ${C.gold}`:"2px solid transparent",
+              cursor:"pointer",letterSpacing:0.5}}>
+            {lbl}
+          </div>
+        ))}
+      </div>
+
+      <div style={{flex:1,overflow:"hidden"}}>
+        {tab==="today"&&todayPage}
+        {tab==="positions"&&posPage}
+        {tab==="add"&&addPage}
+      </div>
+
+      <div style={{background:"rgba(7,9,12,0.97)",backdropFilter:"blur(12px)",
+        borderTop:`1px solid ${C.border}`,display:"flex",flexShrink:0,
+        paddingBottom:"env(safe-area-inset-bottom,0)"}}>
+        {[{id:"today",icon:"🎯",l:"分析"},{id:"positions",icon:"📊",l:"持倉"},{id:"add",icon:"＋",l:"新增"}].map(n=>(
+          <button key={n.id} onClick={()=>setTab(n.id)}
+            style={{flex:1,padding:"12px 8px",display:"flex",flexDirection:"column",alignItems:"center",
+              gap:4,background:"none",border:"none",cursor:"pointer"}}>
+            <div style={{fontSize:20,opacity:tab===n.id?1:0.3}}>{n.icon}</div>
+            <div style={{fontSize:9,letterSpacing:1,textTransform:"uppercase",
+              fontFamily:"'JetBrains Mono',monospace",
+              color:tab===n.id?C.gold:C.muted,fontWeight:tab===n.id?700:400}}>{n.l}</div>
+          </button>
+        ))}
+      </div>
+
+      {toast&&(
+        <div style={{position:"fixed",bottom:90,left:"50%",transform:"translateX(-50%)",
+          background:C.surf,border:`1px solid ${C.border2}`,borderRadius:6,
+          padding:"10px 18px",fontSize:12,color:C.text,zIndex:200,whiteSpace:"nowrap",
+          fontFamily:"'JetBrains Mono',monospace"}}>{toast}</div>
+      )}
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
